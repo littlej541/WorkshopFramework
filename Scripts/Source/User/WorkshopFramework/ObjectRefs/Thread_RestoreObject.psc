@@ -67,7 +67,7 @@ Function RunCode()
 	;ModTrace("Thread_RestoreObject attempting to restore " + BaseForm)
 	; If yes, can we restore it?
 	Bool bCreateNew = true
-	if(kFoundRef != None)
+	if(kFoundRef != None && ! kFoundRef.IsDeleted())
 		ModTrace("    Found ref " + kFoundRef)
 		
 		if(kFoundRef.IsDisabled())
@@ -149,6 +149,9 @@ Function RunCode()
 			if( ! F4SEManager.IsF4SERunning || GetSetting_Import_FauxPowerItems().GetValueInt() == 1)
 				kThread.bFauxPowered = true
 			endif
+			
+			String sCallBackID = ""
+			ThreadManager.QueueThread(kThread, sCallBackID)
 		endif
 	endif
 EndFunction

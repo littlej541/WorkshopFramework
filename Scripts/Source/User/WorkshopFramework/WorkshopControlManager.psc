@@ -140,6 +140,14 @@ Function CaptureSettlement(WorkshopScript akWorkshopRef, FactionControl aFaction
 	
 	SetControllingFaction(akWorkshopRef, aFactionData)
 	
+	; 2.4.11
+	if(aFactionData.iUseNewSettlerFlag == 1)
+		akWorkshopRef.bSetNewSettlerFlagOnNewlySpawnedResidents = true
+	elseif(aFactionData.iUseNewSettlerFlag == 0)
+		akWorkshopRef.bSetNewSettlerFlagOnNewlySpawnedResidents = false
+	endif
+	
+	
 	Faction thisFaction = GetFactionFromFactionData(aFactionData)
 	
 	if(thisFaction != PreviousControllingFaction)

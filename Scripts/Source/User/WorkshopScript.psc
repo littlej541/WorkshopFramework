@@ -1407,6 +1407,8 @@ Int Property RobotHappinessLevel
 	EndFunction
 EndProperty
 
+Bool Property bSetNewSettlerFlagOnNewlySpawnedResidents = true Auto Hidden ; WSFW 2.4.11
+
 
 Bool Property bAllowLinkedConsumption = true Auto Hidden ; WSFW - Allow flagging a particular workshop to not share its workshop contents for consumption by other settlements
 

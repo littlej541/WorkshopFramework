@@ -387,6 +387,10 @@ Struct FactionControl
 	
 	Bool bTreatAllOtherFactionsAsEnemies = false
 	{ If true, all factions outside of these lists will be considered enemies. If false, all factions outside of these lists will be considered friendly. }
+
+	; 2.4.11
+	Int iUseNewSettlerFlag = -1
+	{ If set to 1, when new settlers are spawned in settlements controlled by this faction, they will get the bNewSettler bool set to true so that they will introduce themselves to the player. If 0, this default behavior will be disabled for settlements this faction controls. -1 tells the setting to leave the behavior alone, to be impacted by any other source that affects it. }
 EndStruct
 
 ; 1.1.0 - Struct for new assault system

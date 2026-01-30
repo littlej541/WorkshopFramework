@@ -99,6 +99,11 @@ EndFunction
 ; -----------------------------------
 
 WorkshopNPCScript Function SpawnWorkshopNPC(WorkshopScript akWorkshopRef, Bool abBrahmin = false, ActorBase aActorFormOverride = None) global
+	return SpawnWorkshopNPCV2(akWorkshopRef, abBrahmin, aActorFormOverride, aiFlagAsNewSettler = -1)
+EndFunction
+
+; 2.4.11 - Added aiFlagAsNewSettler option to allow for mods to disable their workshop NPCs from force greeting the player the first time the player encounters them. -1 = use workshop's new bSetNewSettlerFlagOnNewlySpawnedResidents value, 0 = don't flag as new settler, 1 = do
+WorkshopNPCScript Function SpawnWorkshopNPCV2(WorkshopScript akWorkshopRef, Bool abBrahmin = false, ActorBase aActorFormOverride = None, Int aiFlagAsNewSettler = -1) global
 	WorkshopFramework:WSFW_APIQuest API = GetAPI()
 	
 	if( ! API)
@@ -107,11 +112,11 @@ WorkshopNPCScript Function SpawnWorkshopNPC(WorkshopScript akWorkshopRef, Bool a
 	endif
 	
 	if(aActorFormOverride != None)
-		return API.NPCManager.CreateWorkshopNPC(aActorFormOverride, akWorkshopRef)
+		return API.NPCManager.CreateWorkshopNPCV2(aActorFormOverride, akWorkshopRef, None, aiFlagAsNewSettler)
 	elseif(abBrahmin)
 		return API.NPCManager.CreateBrahmin(akWorkshopRef)
 	else
-		return API.NPCManager.CreateSettler(akWorkshopRef)
+		return API.NPCManager.CreateSettlerV2(akWorkshopRef, None, aiFlagAsNewSettler)
 	endif
 EndFunction
 

@@ -487,9 +487,14 @@ EndFunction
 
 
 WorkshopNPCScript Function CreateSettler(WorkshopScript akWorkshopRef, ObjectReference akSpawnAtRef = None)
+	return CreateSettlerV2(akWorkshopRef, akSpawnAtRef, aiFlagAsNewSettler = -1)
+endFunction
+
+; 2.4.11 - Added aiFlagAsNewSettler option to allow for mods to disable their workshop NPCs from force greeting the player the first time the player encounters them. -1 = use workshop's new bSetNewSettlerFlagOnNewlySpawnedResidents value, 0 = don't flag as new settler, 1 = do
+WorkshopNPCScript Function CreateSettlerV2(WorkshopScript akWorkshopRef, ObjectReference akSpawnAtRef = None, Int aiFlagAsNewSettler = -1)
 	ActorBase thisActorBase = GetSettlerForm(akWorkshopRef)
 		
-	return CreateWorkshopNPC(thisActorBase, akWorkshopRef, akSpawnAtRef)
+	return CreateWorkshopNPCV2(thisActorBase, akWorkshopRef, akSpawnAtRef, aiFlagAsNewSettler)
 EndFunction
 
 
@@ -540,8 +545,12 @@ WorkshopNPCScript Function CreateBrahmin(WorkshopScript akWorkshopRef, ObjectRef
 	return CreateWorkshopNPC(BrahminActorBase, akWorkshopRef, akSpawnAtRef)
 EndFunction
 
-
 WorkshopNPCScript Function CreateWorkshopNPC(ActorBase aActorForm, WorkshopScript akWorkshopRef, ObjectReference akSpawnAtRef = None)
+	return CreateWorkshopNPCV2(aActorForm, akWorkshopRef, akSpawnAtRef, aiFlagAsNewSettler = -1)
+EndFunction
+
+; 2.4.11 - Added aiFlagAsNewSettler option to allow for mods to disable their workshop NPCs from force greeting the player the first time the player encounters them. -1 = use workshop's new bSetNewSettlerFlagOnNewlySpawnedResidents value, 0 = don't flag as new settler, 1 = do
+WorkshopNPCScript Function CreateWorkshopNPCV2(ActorBase aActorForm, WorkshopScript akWorkshopRef, ObjectReference akSpawnAtRef = None, Int aiFlagAsNewSettler = -1)
 	if( ! akWorkshopRef)
 		return None
 	endif
@@ -567,7 +576,19 @@ WorkshopNPCScript Function CreateWorkshopNPC(ActorBase aActorForm, WorkshopScrip
 		endif
 		
 		If(aActorForm != BrahminActorBase)
-			asWorkshopNPC.bNewSettler = true
+			Bool bNewSettlerValue = true
+			if(aiFlagAsNewSettler == -1)
+				; Use default
+				bNewSettlerValue = akWorkshopRef.bSetNewSettlerFlagOnNewlySpawnedResidents
+			elseif(aiFlagAsNewSettler == 0)
+				; Disable
+				bNewSettlerValue = false
+			elseif(aiFlagAsNewSettler == 1)
+				; Enable
+				bNewSettlerValue = true
+			endif
+			
+			asWorkshopNPC.bNewSettler = bNewSettlerValue
 			
 			;check for synth
 			Int iSynthPopulation = akWorkshopRef.GetBaseValue(SynthPopulation) as int
