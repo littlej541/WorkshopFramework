@@ -123,6 +123,7 @@ Group Factions
 	Faction Property WorkshopCaravanFaction Auto Const Mandatory ; 1.1.3
 	Faction Property WorkshopNPCFaction Auto Const Mandatory ; 1.1.3
 	Faction Property CaptiveFaction Auto Const Mandatory ; 1.1.3
+	Faction Property WSFW_WasInWorkshopNPCFaction Auto Const Mandatory ; 3.6.0
 EndGroup
 
 Group Keywords
@@ -804,6 +805,12 @@ Function SetupAssault()
 		
 	; 2.3.5 - Make sure attackers aren't in WorkshopNPCFaction or the settlement's ownership faction or they won't be hostile to defenders
 	RemoveSettlementFactionsFromCollection(AttackerFactionAlias)
+	
+	; In player-led assaults, don't let the settlement's ambient ownership faction drive
+	; hostility during combat. The assault factions and reaction overrides handle combat.
+	if(bPlayerInvolved && iCurrentAssaultType != AssaultManager.iType_Defend)
+		RemoveSettlementOwnershipFactionFromCollection(DefenderFactionAlias)
+	endif
 		
 	; 2.3.3 - Storing original attacker/defender sets in unique collections. This is to maintain a copy of the original sets of attackers and defenders without having to check PlayerAllies and PlayerEnemies since we want to eventually support NPC vs NPC assaults
 	StartingAttackers.AddRefCollection(Attackers)
@@ -1547,7 +1554,10 @@ Function RemoveSettlementFactions(Actor akActorRef)
 		akActorRef.RemoveFromFaction(kActorWorkshopRef.SettlementOwnershipFaction)
 	endif
 	
-	akActorRef.RemoveFromFaction(WorkshopNPCFaction)
+	if(akActorRef.IsInFaction(WorkshopNPCFaction))
+		akActorRef.AddToFaction(WSFW_WasInWorkshopNPCFaction)
+		akActorRef.RemoveFromFaction(WorkshopNPCFaction)
+	endif
 EndFunction
 
 Function RestoreSettlementFactionsToCollection(RefCollectionAlias aCollection)
@@ -1560,6 +1570,62 @@ Function RestoreSettlementFactionsToCollection(RefCollectionAlias aCollection)
 		
 		i += 1
 	endWhile
+EndFunction
+
+Function RemoveSettlementOwnershipFactionFromCollection(RefCollectionAlias aCollection)
+	int i = 0
+	while(i < aCollection.GetCount())
+		Actor thisActor = aCollection.GetAt(i) as Actor
+		if(thisActor != None)
+			RemoveSettlementOwnershipFaction(thisActor)
+		endif
+		
+		i += 1
+	endWhile
+EndFunction
+
+Function RemoveSettlementOwnershipFaction(Actor akActorRef)
+	WorkshopScript kActorWorkshopRef = akActorRef.GetLinkedRef(WorkshopItemKeyword) as WorkshopScript
+	if(kActorWorkshopRef != None && kActorWorkshopRef.SettlementOwnershipFaction != None && kActorWorkshopRef.UseOwnershipFaction)
+		if(ApplyWorkshopOwnerFaction(akActorRef))
+			if(CountsForPopulation(akActorRef))
+				akActorRef.SetCrimeFaction(None)
+			else
+				akActorRef.SetFactionOwner(None)
+			endif
+		endif
+		
+		akActorRef.RemoveFromFaction(kActorWorkshopRef.SettlementOwnershipFaction)
+	endif
+EndFunction
+
+Function RestoreSettlementOwnershipFactionToCollection(RefCollectionAlias aCollection)
+	int i = 0
+	while(i < aCollection.GetCount())
+		Actor thisActor = aCollection.GetAt(i) as Actor
+		if(thisActor != None)
+			RestoreSettlementOwnershipFaction(thisActor)
+		endif
+		
+		i += 1
+	endWhile
+EndFunction
+
+Function RestoreSettlementOwnershipFaction(Actor akActorRef)
+	WorkshopScript kActorWorkshopRef = akActorRef.GetLinkedRef(WorkshopItemKeyword) as WorkshopScript
+	if(kActorWorkshopRef != None && akActorRef.IsInFaction(WorkshopNPCFaction))
+		if(kActorWorkshopRef.SettlementOwnershipFaction != None && kActorWorkshopRef.UseOwnershipFaction)
+			if(ApplyWorkshopOwnerFaction(akActorRef))
+				if(CountsForPopulation(akActorRef))
+					akActorRef.SetCrimeFaction(kActorWorkshopRef.SettlementOwnershipFaction)
+				else
+					akActorRef.SetFactionOwner(kActorWorkshopRef.SettlementOwnershipFaction)
+				endif
+				
+				akActorRef.AddToFaction(kActorWorkshopRef.SettlementOwnershipFaction)
+			endif
+		endif
+	endif
 EndFunction
 
 Function RestoreSettlementFactions(Actor akActorRef)
@@ -1579,7 +1645,11 @@ Function RestoreSettlementFactions(Actor akActorRef)
 			endif
 		endif
 		
-		akActorRef.AddToFaction(WorkshopNPCFaction)
+
+		if(akActorRef.IsInFaction(WSFW_WasInWorkshopNPCFaction))
+			akActorRef.AddToFaction(WorkshopNPCFaction)
+			akActorRef.RemoveFromFaction(WSFW_WasInWorkshopNPCFaction)
+		endif
 	endif
 EndFunction
 
@@ -1590,6 +1660,10 @@ Function CleanupAssault()
 	if(Attackers != None)
 		Attackers.RemoveFromFaction(ActivateAIFaction) ; Clear attack AI
 		RestoreSettlementFactionsToCollection(Attackers)
+	endif
+	
+	if(Defenders != None && bPlayerInvolved && iCurrentAssaultType != AssaultManager.iType_Defend)
+		RestoreSettlementOwnershipFactionToCollection(Defenders)
 	endif
 	
 	if(Children != None)
