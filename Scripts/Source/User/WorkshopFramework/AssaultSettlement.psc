@@ -542,6 +542,9 @@ EndEvent
 ; ------------------------------------------- 
 ; Functions
 ; -------------------------------------------
+Function ForceOpenDebugLog()
+	Debug.OpenUserLog(sLogName)
+EndFunction
 
 Int Function GetReserveID()
 	return iReserveID
@@ -1970,6 +1973,7 @@ EndFunction
 ; Added in 1.1.10 to ensure an assault doesn't get stuck if an Alias script fails to register a death/subdue
 ; 2.3.11 - Modified this check to also do a full reset of the location of unloaded or non-visible enemies to avoid them stuck under the world. Previously this would only hit the first NPC and then exit the check.
 Bool Function CheckForEnemiesDown()
+	ModTraceCustom(sLogName, Self + ".CheckForEnemiesDown()")
 	Actor PlayerRef = PlayerAlias.GetActorRef()
 	int iCount = SubdueToComplete.GetCount()
 	Bool bAllDown = true
@@ -1993,7 +1997,8 @@ Bool Function CheckForEnemiesDown()
 	
 	Bool bPlayerCanSeeMoveToRef = PlayerRef.HasDetectionLOS(kMoveToRef)
 	
-	if(iCount > 0)		
+	if(iCount > 0)
+		ModTraceCustom(sLogName, "     Found " + iCount + " actors that need to be subdued.")
 		int i = iCount
 		while(i > 0)
 			i -= 1
@@ -2011,7 +2016,7 @@ Bool Function CheckForEnemiesDown()
 						Bool bIsActor3dloaded = thisActor.Is3dLoaded()
 						Float fDistanceToPlayer = PlayerRef.GetDistance(thisActor)
 							; We're only trying to move actors that are stuck under the world - this should only happen near the start location, hence the small distance check
-						if(bIsActor3dloaded && bPlayerInvolved && ! bPlayerCanSeeMoveToRef && thisActor.GetDistance(kMoveToRef) < 1000.0 && ! PlayerRef.HasDetectionLOS(thisActor) && fDistanceToPlayer > 2000.0)
+						if(bPlayerInvolved && ! bPlayerCanSeeMoveToRef && thisActor.GetDistance(kMoveToRef) > 1000.0 && ! PlayerRef.HasDetectionLOS(thisActor) && fDistanceToPlayer > 2000.0)
 						
 							; In case the actor fled, the AI package took it somewhere strange, or the game put them under the world
 							
@@ -2032,33 +2037,45 @@ Bool Function CheckForEnemiesDown()
 	iCount = KillToComplete.GetCount()
 	
 	if(iCount > 0)
+		ModTraceCustom(sLogName, "     Found " + iCount + " actors that need to be killed.")
 		int i = iCount
 		while(i > 0)
 			i -= 1
 			Actor thisActor = KillToComplete.GetAt(i) as Actor
 			
 			if(thisActor != None)
+				ModTraceCustom(sLogName, "        Checking actor " + thisActor + ".")
 				if(thisActor.IsDeleted())
 					KillToComplete.RemoveRef(thisActor)
-				elseif(thisActor && ! thisActor.IsBleedingOut() && ! thisActor.IsDead())
+				elseif( ! thisActor.IsBleedingOut() && ! thisActor.IsDead())
 					if(thisActor.IsDisabled())
 						thisActor.Enable(false)
 					endif
 					
+					ModTraceCustom(sLogName, "          Actor " + thisActor + " is alive and not bleeding out.")
+					
 					if(bAutoAttemptToPreventEnemiesUnderTheWorld)
+						ModTraceCustom(sLogName, "          Checking can move actor " + thisActor + ".")
 						Bool bIsActor3dloaded = thisActor.Is3dLoaded()
 						Float fDistanceToPlayer = PlayerRef.GetDistance(thisActor)
 							; We're only trying to move actors that are stuck under the world - this should only happen near the start location, hence the small distance check
-						if(bIsActor3dloaded && bPlayerInvolved && ! bPlayerCanSeeMoveToRef && thisActor.GetDistance(kMoveToRef) < 1000.0 && ! PlayerRef.HasDetectionLOS(thisActor) && fDistanceToPlayer > 2000.0)
+						if(bPlayerInvolved && ! bPlayerCanSeeMoveToRef && thisActor.GetDistance(kMoveToRef) > 1000.0 && ! PlayerRef.HasDetectionLOS(thisActor) && fDistanceToPlayer > 2000.0)
 						
 							; In case the actor fled, the AI package took it somewhere strange, or the game put them under the world
-							
+							ModTraceCustom(sLogName, "          Moving actor " + thisActor + " to " + kMoveToRef + ".")
 							thisActor.MoveTo(kMoveToRef)
 							
 							if(bIsActor3dloaded)
 								thisActor.MoveToNearestNavmeshLocation()
 							endif
-						endif				
+						else
+							ModTraceCustom(sLogName, "          Actor " + thisActor + " failed move checks.")
+							ModTraceCustom(sLogName, "                  bPlayerInvolved = " + bPlayerInvolved)
+							ModTraceCustom(sLogName, "                  bPlayerCanSeeMoveToRef = " + bPlayerCanSeeMoveToRef)
+							ModTraceCustom(sLogName, "                  " + thisActor + ".GetDistance(" + kMoveToRef + ") = " + thisActor.GetDistance(kMoveToRef))
+							ModTraceCustom(sLogName, "                  PlayerRef.HasDetectionLOS(" + thisActor + ") = " +  PlayerRef.HasDetectionLOS(thisActor))
+							ModTraceCustom(sLogName, "                  fDistanceToPlayer = " + fDistanceToPlayer)
+						endif			
 						
 						bAllDown = false
 					endif

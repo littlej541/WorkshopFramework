@@ -79,6 +79,56 @@ Function CleanMenus()
 EndFunction
 
 
+; ------------------------------
+; RegisterWorkshopMenu
+;
+; Description: Allow mods to inject to workshop menu without being dependent.
+;	aTargetMenu					- workshop menu to inject into
+;	aInjectKeywordOrFormlist	- workshop recipe filter keyword or formlist menu to inject into aTargetMenu
+;
+; Usage: How to use without being dependent.
+;	ScriptObject WorkshopMenuManager = Game.GetFormFromFile(0x0001143E, "WorkshopFramework.esm") as ScriptObject
+;	Var[] args = new Var[2]
+;	args[0] = TargetMenu				; TargetMenu being a FormList var in your script.
+;	args[1] = InjectKeywordOrFormlist	; Keyword or FormList you want to inject into TargetMenu defined in your script.
+;	WorkshopMenuManager.CallFunction("RegisterWorkshopMenu", args)
+; ------------------------------
+Function RegisterWorkshopMenu(Formlist aTargetMenu, Form aInjectKeywordOrFormlist)
+	if(aTargetMenu == None || aInjectKeywordOrFormlist == None || (! aInjectKeywordOrFormlist as Keyword && ! aInjectKeywordOrFormlist as Formlist))
+		; invalid or missing params
+		return
+	endif
+	
+	WorkshopMenuInjection MenuInjection = new WorkshopMenuInjection
+	MenuInjection.TargetMenu = aTargetMenu
+	MenuInjection.InjectKeywordOrFormlist = aInjectKeywordOrFormlist
+	RegisterMenu(MenuInjection)
+EndFunction
+
+
+; ------------------------------
+; UnregisterWorkshopMenu
+;
+; Description: Allow mods to remove previously injected workshop menu items without being dependent.
+;	aTargetMenu					- workshop menu injected into
+;	aInjectKeywordOrFormlist	- added workshop recipe filter keyword or formlist menu to remove from aTargetMenu
+;
+; Note: Forms not added via script can not be removed via script.
+; See RegisterWorkshopMenu for use example.
+; ------------------------------
+Function UnregisterWorkshopMenu(Formlist aTargetMenu, Form aInjectKeywordOrFormlist)
+	if(aTargetMenu == None || aInjectKeywordOrFormlist == None || (! aInjectKeywordOrFormlist as Keyword && ! aInjectKeywordOrFormlist as Formlist))
+		; invalid or missing params
+		return
+	endif
+	
+	WorkshopMenuInjection MenuInjection = new WorkshopMenuInjection
+	MenuInjection.TargetMenu = aTargetMenu
+	MenuInjection.InjectKeywordOrFormlist = aInjectKeywordOrFormlist
+	UnregisterMenu(MenuInjection)
+EndFunction
+
+
 Function RegisterMenu(WorkshopMenuInjection aMenuInjection)
 	if(aMenuInjection.TargetMenu != None && ((aMenuInjection.InjectKeywordOrFormlist as Keyword != None) || (aMenuInjection.InjectKeywordOrFormlist as Formlist != None)))
 		if( ! aMenuInjection.TargetMenu.HasForm(aMenuInjection.InjectKeywordOrFormlist))
