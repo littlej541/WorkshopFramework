@@ -488,7 +488,7 @@ Function RunCode()
 		kTempPositionHelper.Disable(false)
 		kTempPositionHelper.Delete()
 	endif
-	
+
 	if(bVerbose)
 		Debug.MessageBox("Thread_PlaceObject: Completed RunCode.")
 	endif

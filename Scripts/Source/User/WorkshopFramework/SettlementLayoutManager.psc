@@ -25,18 +25,23 @@ CustomEvent SettlementLayoutAdded
 CustomEvent SettlementLayoutBuilt
 CustomEvent SettlementLayoutScrapped
 CustomEvent ExportStarting
+CustomEvent SettlementLayoutOperationCompleted
 
 ; ---------------------------------------------
 ; Consts
 ; ---------------------------------------------
 
 String sExportLogBase = "WSFWExport_Settlement" Const
+String sLayoutRecoveryLog = "WSFWLayoutRecovery" Const
 String sPlaceObjectCallbackID = "WSFW_PlaceObject" Const
 String sExportCallbackID = "WSFW_ExportObjectData" Const
 String sScrapObjectCallbackID = "WSFW_ScrapObject" Const
 Int iGroupType_WorkshopResources = 1 Const
 Int iGroupType_NonResources = 2 Const
 Int iDummyCallbackCount = 10000 Const
+Int iTimerID_LayoutWorkerWatchdog = 1 Const
+Float fLayoutWorkerWatchdogInterval = 10.0 Const
+Float fLayoutOperationQueueTimeout = 60.0 Const
 
 String sProgressBarID_Export = "ExportProgress" Const
 String sProgressBarID_Scrap = "ScrapProgress" Const
@@ -107,6 +112,7 @@ Group Keywords
 	Keyword Property PowerArmorKeyword Auto Const Mandatory
 	Keyword Property PreventLayoutScrappingKeyword Auto Const Mandatory
 	Keyword Property TemporaryPreventScrappingKeyword Auto Const Mandatory
+	Keyword Property ActiveLayoutWorkerKeyword Auto Const Mandatory
 	
 	UniversalForm[] Property AlwaysAllowedActorTypes Auto Const Mandatory
 	{ Keywords or forms that should be imported/exported even when options exclude most Actors - for things like turrets and armor stands }
@@ -155,6 +161,18 @@ EndFunction
 
 ; Handle tracking of item building via threading
 CallbackTracking[] LayoutBuildTracking
+WorkshopScript[] LayoutBuildTrackingWorkshops
+
+Int[] ActiveLayoutOperationIDs
+Int[] LayoutOperationExpectedWorkers
+Int[] LayoutOperationQueuedWorkers
+Int[] LayoutOperationCreditedWorkers
+Bool[] LayoutOperationQueueOpen
+Bool[] LayoutOperationExternalHold
+Bool[] LayoutWorkerCleanupPending
+Float[] LayoutOperationLastProgressTime
+Int[] LayoutOperationRetryCount
+Int iNextLayoutOperationID = 0
 
 Bool bUseHUDProgressModule = false ; On startup, check for hud framework and set to true
 
@@ -191,6 +209,17 @@ Event WorkshopFramework:Library:ThreadRunner.OnThreadCompleted(WorkshopFramework
 	;Debug.Trace("Thread Callback Received: " + sCallbackID)
 	
 	if(sCallbackID == sScrapObjectCallbackID)
+		WorkshopFramework:Library:ObjectRefs:Thread kDurableThread = akargs[2] as WorkshopFramework:Library:ObjectRefs:Thread
+		if(kDurableThread && kDurableThread.bDurableQueued)
+			if(kDurableThread.bDurableCredited)
+				return
+			endif
+
+			kDurableThread.bDurableCredited = true
+			Var[] kCleanupArgs = new Var[0]
+			kDurableThread.CallFunctionNoWait("FinishDurableTracking", kCleanupArgs)
+		endif
+
 		iScrapCallbacksReceived += 1
 		
 		;Debug.Trace("Scrap Callback Received: " + iScrapCallbacksReceived + "/" + iAwaitingScrapCallbacks)
@@ -214,39 +243,10 @@ Event WorkshopFramework:Library:ThreadRunner.OnThreadCompleted(WorkshopFramework
 		endif
 	elseif(sCallbackID == sPlaceObjectCallbackID)
 		WorkshopFramework:ObjectRefs:Thread_PlaceObject kThreadRef = akargs[2] as WorkshopFramework:ObjectRefs:Thread_PlaceObject
-		
-		ObjectReference kCreatedRef = kThreadRef.kResult
-		int iCallbackTrackingIndex = kThreadRef.iBatchID
-		
-		; We have the info we need from the thread, so trigger it's self destruction
-		kThreadRef.bAutoDestroy = true
-		if(kThreadRef.IsBoundGameObjectAvailable())
-			kThreadRef.StartTimer(1.0)
+		if(kThreadRef == None)
+			return
 		endif
-		
-		; v2.3.20 - Add a check to prevent accessing a none var.
-		if(iCallbackTrackingIndex >= 0 && LayoutBuildTracking != None && LayoutBuildTracking.Length > iCallbackTrackingIndex)
-			LayoutBuildTracking[iCallbackTrackingIndex].iCallbacksReceived += 1
-		
-			ModTrace("      PlaceObjectCallback -- Received: " + LayoutBuildTracking[iCallbackTrackingIndex].iCallbacksReceived + ", Awaiting: " + LayoutBuildTracking[iCallbackTrackingIndex].iAwaitingCallbacks)
-		
-			if(LayoutBuildTracking[iCallbackTrackingIndex].iCallbacksReceived >=  LayoutBuildTracking[iCallbackTrackingIndex].iAwaitingCallbacks)
-				BuildingCompleted(iCallbackTrackingIndex)
-			elseif(bManualImportInProgress)
-				Float fProgress = Math.Floor((LayoutBuildTracking[iCallbackTrackingIndex].iCallbacksReceived as Float/LayoutBuildTracking[iCallbackTrackingIndex].iAwaitingCallbacks as Float) * 100) ; *100 to get as whole percentage
-				
-				if(bUseHUDProgressModule)
-					HUDFrameworkManager.UpdateProgressBarPercentage(Self, sProgressBarID_Build, fProgress as Int)
-				else
-					; Update every 15%
-					Float fTarget = 15.0 * (iProgressUpdateCounter_Build + 1)
-					if(fProgress > 0 && fProgress >= fTarget)
-						BuildingProgressUpdate.Show(fProgress)
-						iProgressUpdateCounter_Build += 1
-					endif
-				endif
-			endif
-		endif
+		HandleLayoutWorkerCompleted(kThreadRef)
 	elseif(sCallbackID == sExportCallbackID)
 		iExportCallbacksReceived += 1
 		
@@ -270,6 +270,12 @@ Event WorkshopFramework:Library:ThreadRunner.OnThreadCompleted(WorkshopFramework
 	if(AllCallbacksReceived() && AllCallbacksSent())
 		;Debug.MessageBox("AllCallbacksReceived and AllCallbacksSent - unregistering for callbackthreads.")
 		ThreadManager.UnregisterForCallbackThreads(Self)
+	endif
+EndEvent
+
+Event OnTimer(Int aiTimerID)
+	if(aiTimerID == iTimerID_LayoutWorkerWatchdog)
+		RecoverLayoutOperations()
 	endif
 EndEvent
 
@@ -317,6 +323,7 @@ Function HandleQuestInit()
 	
 	SettlementBuildThreadingInProgress = new Bool[128]
 	PowerUpPhaseComplete = new Bool[128]
+	InitializeLayoutOperationTracking()
 	
 	Parent.HandleQuestInit()
 	
@@ -329,11 +336,13 @@ Function HandleQuestInit()
 	endif
 	
 	RegisterForEvents()
+	Debug.OpenUserLog(sLayoutRecoveryLog)
 EndFunction
 
 
 Function HandleGameLoaded()
 	bExportInProgress = false ; Make sure this never gets stuck
+	Debug.OpenUserLog(sLayoutRecoveryLog)
 	
 	if(HUDFrameworkManager.IsHUDFrameworkInstalled)
 		bUseHUDProgressModule = true
@@ -342,6 +351,8 @@ Function HandleGameLoaded()
 	endif
 	
 	RegisterForEvents()
+	InitializeLayoutOperationTracking()
+	RecoverLayoutOperations()
 	
 	Parent.HandleGameLoaded()
 EndFunction
@@ -376,6 +387,8 @@ Function HandlePlayerEnteredSettlement(WorkshopScript akWorkshopRef)
 	if(iIndex >= 0)
 		ScrapSettlement(AwaitingScrapping[iIndex])
 	endif
+
+	RecoverLayoutOperation(akWorkshopRef)
 EndFunction
 
 
@@ -944,7 +957,7 @@ Int Function ScrapSettlement(WorkshopScript akWorkshopRef, Bool abScrapLinkedAnd
 							sCallbackID = "" ; We don't need the event
 						endif
 						
-						ThreadManager.QueueThread(kThread, sCallbackID)
+						ThreadManager.QueueThreadDurable(kThread, sCallbackID)
 					endif
 				endif
 			endif
@@ -1036,8 +1049,16 @@ EndFunction
 
 
 Int Function FindAvailableLayoutTrackingSlot(Form aLayoutForm)
+	return FindAvailableLayoutTrackingSlotV2(aLayoutForm, None)
+EndFunction
+
+
+Int Function FindAvailableLayoutTrackingSlotV2(Form aLayoutForm, WorkshopScript akWorkshopRef)
 	if(LayoutBuildTracking == None || LayoutBuildTracking.Length == 0)
 		LayoutBuildTracking = new CallbackTracking[128]
+	endif
+	if(LayoutBuildTrackingWorkshops == None || LayoutBuildTrackingWorkshops.Length == 0)
+		LayoutBuildTrackingWorkshops = new WorkshopScript[128]
 	endif
 	
 	int i = 0
@@ -1047,7 +1068,7 @@ Int Function FindAvailableLayoutTrackingSlot(Form aLayoutForm)
 			if(iFirstEmpty < 0)
 				iFirstEmpty = i
 			endif
-		elseif(LayoutBuildTracking[i].RelatedForm == aLayoutForm)
+		elseif(LayoutBuildTracking[i].RelatedForm == aLayoutForm && (akWorkshopRef == None || LayoutBuildTrackingWorkshops[i] == akWorkshopRef))
 			return i
 		endif
 		
@@ -1058,13 +1079,331 @@ Int Function FindAvailableLayoutTrackingSlot(Form aLayoutForm)
 	
 	thisTracker.RelatedForm = aLayoutForm
 	LayoutBuildTracking[iFirstEmpty] = thisTracker
+	LayoutBuildTrackingWorkshops[iFirstEmpty] = akWorkshopRef
 	
 	return iFirstEmpty
 EndFunction
 
 
+Function InitializeLayoutOperationTracking()
+	if(ActiveLayoutOperationIDs == None || ActiveLayoutOperationIDs.Length == 0)
+		ActiveLayoutOperationIDs = new Int[128]
+	endif
+	if(LayoutOperationExpectedWorkers == None || LayoutOperationExpectedWorkers.Length == 0)
+		LayoutOperationExpectedWorkers = new Int[128]
+	endif
+	if(LayoutOperationQueuedWorkers == None || LayoutOperationQueuedWorkers.Length == 0)
+		LayoutOperationQueuedWorkers = new Int[128]
+	endif
+	if(LayoutOperationCreditedWorkers == None || LayoutOperationCreditedWorkers.Length == 0)
+		LayoutOperationCreditedWorkers = new Int[128]
+	endif
+	if(LayoutOperationQueueOpen == None || LayoutOperationQueueOpen.Length == 0)
+		LayoutOperationQueueOpen = new Bool[128]
+	endif
+	if(LayoutOperationExternalHold == None || LayoutOperationExternalHold.Length == 0)
+		LayoutOperationExternalHold = new Bool[128]
+	endif
+	if(LayoutWorkerCleanupPending == None || LayoutWorkerCleanupPending.Length == 0)
+		LayoutWorkerCleanupPending = new Bool[128]
+	endif
+	if(LayoutOperationLastProgressTime == None || LayoutOperationLastProgressTime.Length == 0)
+		LayoutOperationLastProgressTime = new Float[128]
+	endif
+	if(LayoutOperationRetryCount == None || LayoutOperationRetryCount.Length == 0)
+		LayoutOperationRetryCount = new Int[128]
+	endif
+	if(LayoutBuildTrackingWorkshops == None || LayoutBuildTrackingWorkshops.Length == 0)
+		LayoutBuildTrackingWorkshops = new WorkshopScript[128]
+	endif
+EndFunction
+
+
+Int Function OpenLayoutOperation(WorkshopScript akWorkshopRef)
+	if( ! akWorkshopRef || ! ActiveLayoutWorkerKeyword)
+		return -1
+	endif
+
+	Int iOperationID = BeginLayoutOperation(akWorkshopRef)
+	if(iOperationID > 0)
+		LayoutOperationExternalHold[akWorkshopRef.GetWorkshopID()] = true
+	endif
+	return iOperationID
+EndFunction
+
+
+Function CloseLayoutOperation(WorkshopScript akWorkshopRef, Int aiOperationID)
+	if( ! akWorkshopRef || aiOperationID <= 0)
+		return
+	endif
+
+	InitializeLayoutOperationTracking()
+	Int iWorkshopID = akWorkshopRef.GetWorkshopID()
+	if(iWorkshopID < 0 || iWorkshopID >= ActiveLayoutOperationIDs.Length || ActiveLayoutOperationIDs[iWorkshopID] != aiOperationID)
+		return
+	endif
+
+	LayoutOperationExternalHold[iWorkshopID] = false
+	LayoutOperationQueueOpen[iWorkshopID] = false
+	TryToCompleteLayoutOperation(akWorkshopRef)
+	StartLayoutWorkerWatchdog()
+EndFunction
+
+
+Int Function BeginLayoutOperation(WorkshopScript akWorkshopRef)
+	Int iWorkshopID = akWorkshopRef.GetWorkshopID()
+	if(iWorkshopID < 0 || iWorkshopID >= ActiveLayoutOperationIDs.Length)
+		return -1
+	endif
+
+	if(ActiveLayoutOperationIDs[iWorkshopID] <= 0)
+		iNextLayoutOperationID += 1
+		if(iNextLayoutOperationID <= 0 || iNextLayoutOperationID > 1000000)
+			iNextLayoutOperationID = 1
+		endif
+
+		ActiveLayoutOperationIDs[iWorkshopID] = iNextLayoutOperationID
+		LayoutOperationExpectedWorkers[iWorkshopID] = 0
+		LayoutOperationQueuedWorkers[iWorkshopID] = 0
+		LayoutOperationCreditedWorkers[iWorkshopID] = 0
+		LayoutOperationRetryCount[iWorkshopID] = 0
+		ModTraceCustom(sLayoutRecoveryLog, "Opened layout operation " + iNextLayoutOperationID + " for " + akWorkshopRef)
+	endif
+
+	LayoutOperationQueueOpen[iWorkshopID] = true
+	LayoutOperationLastProgressTime[iWorkshopID] = Utility.GetCurrentRealTime()
+	return ActiveLayoutOperationIDs[iWorkshopID]
+EndFunction
+
+
+Bool Function RegisterLayoutWorker(WorkshopFramework:Library:ObjectRefs:Thread akThreadRef, WorkshopScript akWorkshopRef, Int aiOperationID, Int aiCallbackTrackingIndex)
+	if( ! akThreadRef || ! akWorkshopRef || aiOperationID <= 0)
+		return false
+	endif
+
+	InitializeLayoutOperationTracking()
+	Int iWorkshopID = akWorkshopRef.GetWorkshopID()
+	if(iWorkshopID < 0 || iWorkshopID >= ActiveLayoutOperationIDs.Length || ActiveLayoutOperationIDs[iWorkshopID] != aiOperationID)
+		return false
+	endif
+
+	LayoutOperationExpectedWorkers[iWorkshopID] += 1
+	LayoutOperationLastProgressTime[iWorkshopID] = Utility.GetCurrentRealTime()
+	if(aiCallbackTrackingIndex >= 0 && LayoutBuildTracking && aiCallbackTrackingIndex < LayoutBuildTracking.Length && LayoutBuildTracking[aiCallbackTrackingIndex])
+		LayoutBuildTracking[aiCallbackTrackingIndex].iAwaitingCallbacks += 1
+	endif
+
+	Int iQueueResult = ThreadManager.QueueThreadDurable(akThreadRef, sPlaceObjectCallbackID)
+	if(iQueueResult >= 0)
+		LayoutOperationQueuedWorkers[iWorkshopID] += 1
+	else
+		ModTraceCustom(sLayoutRecoveryLog, "Layout operation " + aiOperationID + " could not queue worker " + akThreadRef + " - watchdog will retry it", 2)
+	endif
+
+	return true
+EndFunction
+
+
+Function HandleLayoutWorkerCompleted(WorkshopFramework:ObjectRefs:Thread_PlaceObject akThreadRef)
+	if(akThreadRef.iDurableOperationID <= 0)
+		CreditLayoutBuildTracker(akThreadRef.iBatchID)
+		akThreadRef.bAutoDestroy = true
+		if(akThreadRef.IsBoundGameObjectAvailable())
+			akThreadRef.StartTimer(1.0)
+		endif
+		return
+	endif
+
+	WorkshopScript thisWorkshop = akThreadRef.kDurableOwnerRef as WorkshopScript
+	if( ! thisWorkshop)
+		return
+	endif
+
+	Int iWorkshopID = thisWorkshop.GetWorkshopID()
+	if(iWorkshopID < 0 || iWorkshopID >= ActiveLayoutOperationIDs.Length || ActiveLayoutOperationIDs[iWorkshopID] != akThreadRef.iDurableOperationID)
+		return
+	endif
+
+	if( ! akThreadRef.bDurableCredited)
+		akThreadRef.bDurableCredited = true
+		LayoutOperationCreditedWorkers[iWorkshopID] += 1
+		LayoutOperationLastProgressTime[iWorkshopID] = Utility.GetCurrentRealTime()
+		CreditLayoutBuildTracker(akThreadRef.iDurableBatchID)
+	endif
+
+	Var[] kArgs = new Var[0]
+	akThreadRef.CallFunctionNoWait("FinishDurableTracking", kArgs)
+	LayoutWorkerCleanupPending[iWorkshopID] = true
+	TryToCompleteLayoutOperation(thisWorkshop)
+EndFunction
+
+
+Function CreditLayoutBuildTracker(Int aiCallbackTrackingIndex)
+	if(aiCallbackTrackingIndex < 0 || LayoutBuildTracking == None || LayoutBuildTracking.Length <= aiCallbackTrackingIndex || LayoutBuildTracking[aiCallbackTrackingIndex] == None)
+		return
+	endif
+
+	LayoutBuildTracking[aiCallbackTrackingIndex].iCallbacksReceived += 1
+	ModTrace("      PlaceObjectCallback -- Received: " + LayoutBuildTracking[aiCallbackTrackingIndex].iCallbacksReceived + ", Awaiting: " + LayoutBuildTracking[aiCallbackTrackingIndex].iAwaitingCallbacks)
+
+	if(LayoutBuildTracking[aiCallbackTrackingIndex].iCallbacksReceived >= LayoutBuildTracking[aiCallbackTrackingIndex].iAwaitingCallbacks)
+		WorkshopScript thisWorkshop
+		if(LayoutBuildTrackingWorkshops && LayoutBuildTrackingWorkshops.Length > aiCallbackTrackingIndex)
+			thisWorkshop = LayoutBuildTrackingWorkshops[aiCallbackTrackingIndex]
+		endif
+		if(thisWorkshop && LayoutOperationQueueOpen && ActiveLayoutOperationIDs)
+			Int iWorkshopID = thisWorkshop.GetWorkshopID()
+			if(iWorkshopID >= 0 && iWorkshopID < LayoutOperationQueueOpen.Length && ActiveLayoutOperationIDs[iWorkshopID] > 0 && LayoutOperationQueueOpen[iWorkshopID])
+				return
+			endif
+		endif
+
+		BuildingCompleted(aiCallbackTrackingIndex)
+	elseif(bManualImportInProgress)
+		Float fProgress = Math.Floor((LayoutBuildTracking[aiCallbackTrackingIndex].iCallbacksReceived as Float/LayoutBuildTracking[aiCallbackTrackingIndex].iAwaitingCallbacks as Float) * 100)
+		if(bUseHUDProgressModule)
+			HUDFrameworkManager.UpdateProgressBarPercentage(Self, sProgressBarID_Build, fProgress as Int)
+		else
+			Float fTarget = 15.0 * (iProgressUpdateCounter_Build + 1)
+			if(fProgress > 0 && fProgress >= fTarget)
+				BuildingProgressUpdate.Show(fProgress)
+				iProgressUpdateCounter_Build += 1
+			endif
+		endif
+	endif
+EndFunction
+
+
+Function CompleteLayoutTrackers(WorkshopScript akWorkshopRef)
+	Int i = 0
+	while(i < LayoutBuildTracking.Length)
+		if(LayoutBuildTracking[i] && LayoutBuildTrackingWorkshops[i] == akWorkshopRef)
+			BuildingCompleted(i)
+		endif
+
+		i += 1
+	endWhile
+EndFunction
+
+
+Function StartLayoutWorkerWatchdog()
+	CancelTimer(iTimerID_LayoutWorkerWatchdog)
+	StartTimer(fLayoutWorkerWatchdogInterval, iTimerID_LayoutWorkerWatchdog)
+EndFunction
+
+
+Function RecoverLayoutOperations()
+	InitializeLayoutOperationTracking()
+	Bool bKeepWatching = false
+	Int i = 0
+	while(i < ActiveLayoutOperationIDs.Length)
+		if(ActiveLayoutOperationIDs[i] > 0 || LayoutWorkerCleanupPending[i])
+			WorkshopScript thisWorkshop = WSFW_Main.WorkshopParent.GetWorkshop(i)
+			if(thisWorkshop)
+				RecoverLayoutOperation(thisWorkshop)
+			endif
+		endif
+
+		if(ActiveLayoutOperationIDs[i] > 0 || LayoutWorkerCleanupPending[i])
+			bKeepWatching = true
+		endif
+		i += 1
+	endWhile
+
+	if(bKeepWatching)
+		StartLayoutWorkerWatchdog()
+	endif
+EndFunction
+
+
+Function RecoverLayoutOperation(WorkshopScript akWorkshopRef)
+	if( ! akWorkshopRef || ! ActiveLayoutWorkerKeyword)
+		return
+	endif
+
+	InitializeLayoutOperationTracking()
+	Int iWorkshopID = akWorkshopRef.GetWorkshopID()
+	if(iWorkshopID < 0 || iWorkshopID >= ActiveLayoutOperationIDs.Length)
+		return
+	endif
+
+	Int iOperationID = ActiveLayoutOperationIDs[iWorkshopID]
+	Float fCurrentTime = Utility.GetCurrentRealTime()
+	if(LayoutOperationLastProgressTime[iWorkshopID] > fCurrentTime)
+		LayoutOperationLastProgressTime[iWorkshopID] = fCurrentTime
+	elseif(LayoutOperationQueueOpen[iWorkshopID] && (fCurrentTime - LayoutOperationLastProgressTime[iWorkshopID]) >= fLayoutOperationQueueTimeout)
+		LayoutOperationExternalHold[iWorkshopID] = false
+		LayoutOperationQueueOpen[iWorkshopID] = false
+		ModTraceCustom(sLayoutRecoveryLog, "Closed abandoned layout queue for operation " + iOperationID + " at " + akWorkshopRef, 2)
+	endif
+	ObjectReference[] kWorkerRefs = akWorkshopRef.GetLinkedRefChildren(ActiveLayoutWorkerKeyword)
+	Bool bCleanupStillPending = false
+	Int i = 0
+	while(i < kWorkerRefs.Length)
+		WorkshopFramework:Library:ObjectRefs:Thread thisWorker = kWorkerRefs[i] as WorkshopFramework:Library:ObjectRefs:Thread
+		if(thisWorker)
+			if(thisWorker.bDurableCredited)
+				bCleanupStillPending = true
+				Var[] kCleanupArgs = new Var[0]
+				thisWorker.CallFunctionNoWait("FinishDurableTracking", kCleanupArgs)
+			elseif(iOperationID > 0 && thisWorker.iDurableOperationID == iOperationID)
+				if(thisWorker.bThreadRunComplete)
+					HandleLayoutWorkerCompleted(thisWorker as WorkshopFramework:ObjectRefs:Thread_PlaceObject)
+				elseif( ! thisWorker.bDurableQueued)
+					if(ThreadManager.QueueThreadDurable(thisWorker, sPlaceObjectCallbackID) >= 0)
+						LayoutOperationQueuedWorkers[iWorkshopID] += 1
+						LayoutOperationRetryCount[iWorkshopID] += 1
+					endif
+				endif
+			endif
+		endif
+
+		i += 1
+	endWhile
+
+	LayoutWorkerCleanupPending[iWorkshopID] = bCleanupStillPending
+	TryToCompleteLayoutOperation(akWorkshopRef)
+EndFunction
+
+
+Function TryToCompleteLayoutOperation(WorkshopScript akWorkshopRef)
+	Int iWorkshopID = akWorkshopRef.GetWorkshopID()
+	if(iWorkshopID < 0 || iWorkshopID >= ActiveLayoutOperationIDs.Length || ActiveLayoutOperationIDs[iWorkshopID] <= 0 || LayoutOperationQueueOpen[iWorkshopID])
+		return
+	endif
+
+	if(LayoutOperationCreditedWorkers[iWorkshopID] < LayoutOperationExpectedWorkers[iWorkshopID])
+		return
+	endif
+
+	Int iOperationID = ActiveLayoutOperationIDs[iWorkshopID]
+	CompleteLayoutTrackers(akWorkshopRef)
+	ModTraceCustom(sLayoutRecoveryLog, "Completed layout operation " + iOperationID + " for " + akWorkshopRef + " - expected=" + LayoutOperationExpectedWorkers[iWorkshopID] + ", queued=" + LayoutOperationQueuedWorkers[iWorkshopID] + ", credited=" + LayoutOperationCreditedWorkers[iWorkshopID] + ", retries=" + LayoutOperationRetryCount[iWorkshopID])
+	ActiveLayoutOperationIDs[iWorkshopID] = 0
+	LayoutOperationQueueOpen[iWorkshopID] = false
+
+	Var[] kArgs = new Var[2]
+	kArgs[0] = akWorkshopRef
+	kArgs[1] = iOperationID
+	SendCustomEvent("SettlementLayoutOperationCompleted", kArgs)
+EndFunction
+
+
+Bool Function IsLayoutOperationActive(WorkshopScript akWorkshopRef)
+	if( ! akWorkshopRef)
+		return false
+	endif
+
+	InitializeLayoutOperationTracking()
+	Int iWorkshopID = akWorkshopRef.GetWorkshopID()
+	return iWorkshopID >= 0 && iWorkshopID < ActiveLayoutOperationIDs.Length && ActiveLayoutOperationIDs[iWorkshopID] > 0
+EndFunction
+
+
 Function BuildSettlement(WorkshopScript akWorkshopRef)
-	if(akWorkshopRef == None || akWorkshopRef.AppliedLayouts == None)
+	if(akWorkshopRef == None)
+		return
+	elseif(akWorkshopRef.AppliedLayouts == None)
 		return
 	endif
 	
@@ -1080,6 +1419,12 @@ Function BuildSettlement(WorkshopScript akWorkshopRef)
 	
 	SettlementBuildThreadingInProgress[iWorkshopID] = true ; This settlement under construction
 	UpdatePowerUpPhaseStatus(iWorkshopID, false)
+	Bool bUseDurableLayoutOperation = ActiveLayoutWorkerKeyword != None
+	Int iOperationID = -1
+	if(bUseDurableLayoutOperation)
+		iOperationID = BeginLayoutOperation(akWorkshopRef)
+		bUseDurableLayoutOperation = iOperationID > 0
+	endif
 	
 	; Check if scrapping is queued - if so, we need to protect these items from being scrapped as well
 	Bool bIsScrappingQueued = AwaitingScrapping.Find(akWorkshopRef) >= 0
@@ -1090,13 +1435,14 @@ Function BuildSettlement(WorkshopScript akWorkshopRef)
 	int i = 0	
 	WorkshopFramework:Weapons:SettlementLayout[] Layouts = akWorkshopRef.AppliedLayouts
 	
-	; Need to set a prediction immediately to avoid a race condition where the layout placement threads complete before the AwaitingPlacementCallbacks are updated
+	; KG 3.7.0 - Durable operations count the workers as they are linked instead of guessing how many threads will be created.
 	while(i < Layouts.Length)
 		if( ! akWorkshopRef.LayoutPlacementComplete[i])
-			int iCallbackTrackingIndex = FindAvailableLayoutTrackingSlot(Layouts[i])			
-			int iPredictedThreads = Layouts[i].GetPredictedItemCount()			
-			
-			LayoutBuildTracking[iCallbackTrackingIndex].iAwaitingCallbacks += iPredictedThreads
+			int iCallbackTrackingIndex = FindAvailableLayoutTrackingSlotV2(Layouts[i], akWorkshopRef)
+			int iPredictedThreads = Layouts[i].GetPredictedItemCount()
+			if( ! bUseDurableLayoutOperation)
+				LayoutBuildTracking[iCallbackTrackingIndex].iAwaitingCallbacks += iPredictedThreads
+			endif
 		endif
 		
 		i += 1
@@ -1105,7 +1451,7 @@ Function BuildSettlement(WorkshopScript akWorkshopRef)
 	i = 0
 	while(i < Layouts.Length)
 		if( ! akWorkshopRef.LayoutPlacementComplete[i])
-			int iCallbackTrackingIndex = FindAvailableLayoutTrackingSlot(Layouts[i])
+			int iCallbackTrackingIndex = FindAvailableLayoutTrackingSlotV2(Layouts[i], akWorkshopRef)
 			
 			; Restore vanilla objects
 			if(akWorkshopRef.Is3dLoaded())
@@ -1114,23 +1460,35 @@ Function BuildSettlement(WorkshopScript akWorkshopRef)
 			
 			; Send our tracking index as a custom callback ID so we can track placement\
 				; Build non-workshop resources
-			int iNonResourceThreadsStarted = Layouts[i].PlaceNonResourceObjects(akWorkshopRef, iCallbackTrackingIndex, abProtectFromScrapPhase = bIsScrappingQueued)
+			int iNonResourceThreadsStarted
+			if(bUseDurableLayoutOperation)
+				iNonResourceThreadsStarted = Layouts[i].PlaceNonResourceObjectsV2(akWorkshopRef, iCallbackTrackingIndex, abProtectFromScrapPhase = bIsScrappingQueued, aiOperationID = iOperationID, akTrackingKeyword = ActiveLayoutWorkerKeyword)
+			else
+				iNonResourceThreadsStarted = Layouts[i].PlaceNonResourceObjects(akWorkshopRef, iCallbackTrackingIndex, abProtectFromScrapPhase = bIsScrappingQueued)
+			endif
 			int iThreadsStarted = iNonResourceThreadsStarted
 			
 			ModTrace("[SettlementLayoutManager] Started " + iNonResourceThreadsStarted + " for layout " + Layouts[i] + " NonResourceObjects.")
 				; Build workshop resources
-			int iResourceThreadsStarted = Layouts[i].PlaceWorkshopResources(akWorkshopRef, iCallbackTrackingIndex, abProtectFromScrapPhase = bIsScrappingQueued)
+			int iResourceThreadsStarted
+			if(bUseDurableLayoutOperation)
+				iResourceThreadsStarted = Layouts[i].PlaceWorkshopResourcesV2(akWorkshopRef, iCallbackTrackingIndex, abProtectFromScrapPhase = bIsScrappingQueued, aiOperationID = iOperationID, akTrackingKeyword = ActiveLayoutWorkerKeyword)
+			else
+				iResourceThreadsStarted = Layouts[i].PlaceWorkshopResources(akWorkshopRef, iCallbackTrackingIndex, abProtectFromScrapPhase = bIsScrappingQueued)
+			endif
 			iThreadsStarted += iResourceThreadsStarted
 			
 			ModTrace("[SettlementLayoutManager] Started " + iResourceThreadsStarted + " for layout " + Layouts[i] + " WorkshopResources.")
 			
-			; If prediction was off, correct it
-			LayoutBuildTracking[iCallbackTrackingIndex].iAwaitingCallbacks -= Layouts[i].GetPredictedItemCount() - iThreadsStarted
-			
+			if( ! bUseDurableLayoutOperation)
+				LayoutBuildTracking[iCallbackTrackingIndex].iAwaitingCallbacks -= Layouts[i].GetPredictedItemCount() - iThreadsStarted
+			endif
+
 			if(LayoutBuildTracking[iCallbackTrackingIndex].iCallbacksReceived >= LayoutBuildTracking[iCallbackTrackingIndex].iAwaitingCallbacks)
 				BuildingCompleted(iCallbackTrackingIndex)
 			endif
-			
+
+			; KG 3.7.0 - Keep later BuildSettlement calls from queueing the same layout again while its workers finish.
 			akWorkshopRef.LayoutPlacementComplete[i] = true
 		endif
 		
@@ -1138,6 +1496,11 @@ Function BuildSettlement(WorkshopScript akWorkshopRef)
 	endWhile
 	
 	SettlementBuildThreadingInProgress[iWorkshopID] = false
+	if(bUseDurableLayoutOperation && ! LayoutOperationExternalHold[iWorkshopID])
+		LayoutOperationQueueOpen[iWorkshopID] = false
+		TryToCompleteLayoutOperation(akWorkshopRef)
+		StartLayoutWorkerWatchdog()
+	endif
 EndFunction
 
 
@@ -1630,8 +1993,18 @@ Function BuildingCompleted(Int aiCallbackTrackingIndex)
 	;Debug.MessageBox("Layout building completed. " + LayoutBuildTracking[aiCallbackTrackingIndex].iCallbacksReceived + " objects placed. Attempting to wire/power.")
 	
 	; All callbacks received, send out event, trigger power up, and clear this tracker
-	WorkshopScript thisWorkshop = GetUniversalForm(thisLayout.WorkshopRef) as WorkshopScript
+	WorkshopScript thisWorkshop
+	if(LayoutBuildTrackingWorkshops && LayoutBuildTrackingWorkshops.Length > aiCallbackTrackingIndex)
+		thisWorkshop = LayoutBuildTrackingWorkshops[aiCallbackTrackingIndex]
+	endif
+	if( ! thisWorkshop)
+		thisWorkshop = GetUniversalForm(thisLayout.WorkshopRef) as WorkshopScript
+	endif
 	int iWorkshopID = thisWorkshop.GetWorkshopID()
+	Int iLayoutIndex = thisWorkshop.AppliedLayouts.Find(thisLayout)
+	if(iLayoutIndex >= 0 && thisWorkshop.LayoutPlacementComplete && thisWorkshop.LayoutPlacementComplete.Length > iLayoutIndex)
+		thisWorkshop.LayoutPlacementComplete[iLayoutIndex] = true
+	endif
 	
 	; We suspended the individual objects from calling recalc on the workshop so let's do it now for the entire place
 	thisWorkshop.RecalculateWorkshopResources()
@@ -1661,6 +2034,9 @@ Function BuildingCompleted(Int aiCallbackTrackingIndex)
 	bManualImportInProgress = false
 	
 	LayoutBuildTracking[aiCallbackTrackingIndex] = None
+	if(LayoutBuildTrackingWorkshops && LayoutBuildTrackingWorkshops.Length > aiCallbackTrackingIndex)
+		LayoutBuildTrackingWorkshops[aiCallbackTrackingIndex] = None
+	endif
 EndFunction
 
 Function ScrappingCompleted()
@@ -1755,7 +2131,7 @@ Function FindAndRemoveMisplacedItems()
 							sCallbackID = "" ; We don't need the event
 						endif
 						
-						ThreadManager.QueueThread(kThread)
+						ThreadManager.QueueThreadDurable(kThread, sCallbackID)
 					else
 						; Failed to start thread
 						thisRef.Disable(false)

@@ -68,6 +68,18 @@ kArgs[1] = iReserveID
 ; Consts
 ; ---------------------------------------------
 
+String sAssaultPreparationLogName = "SS2AssaultPreparation" Const
+
+
+Function _TraceAssaultPreparation(Int aiReserveID, String asPhase, String asDetails = "")
+	String sMessage = "[Reserve " + aiReserveID + "][Time " + Utility.GetCurrentRealTime() + "] " + asPhase
+	if(asDetails != "")
+		sMessage += ". " + asDetails
+	endif
+
+	ModTraceCustom(sAssaultPreparationLogName, sMessage)
+EndFunction
+
 
 ; ---------------------------------------------
 ; Editor Properties 
@@ -193,6 +205,11 @@ EndFunction
 Function HandleInstallModChanges()
 	; Make sure we are registered for any new assault quests
 	RegisterDefaultAssaultQuests()
+
+	int iCorpseCleanupVersion = 133
+	if(iInstalledVersion < iCorpseCleanupVersion)
+		ClearStoppedAssaultAliases()
+	endif
 		
 	Parent.HandleInstallModChanges()
 EndFunction
@@ -263,6 +280,8 @@ EndFunction
 Int Function SetupNewAssault(Location akTargetLocation, Int aiType, Bool abInvolvePlayer = true, ObjectReference akCustomVerb = None)
 	; Generate new reserve ID
 	Int iReserveID = NextReserveID
+	Debug.OpenUserLog(sAssaultPreparationLogName)
+	_TraceAssaultPreparation(iReserveID, "WSFW quest reservation started", "Target: " + akTargetLocation + "; type: " + aiType + "; player involved: " + abInvolvePlayer)
 	
 	if(akCustomVerb == None)
 		ObjectReference SpawnAt = SafeSpawnPoint.GetRef()
@@ -276,6 +295,7 @@ Int Function SetupNewAssault(Location akTargetLocation, Int aiType, Bool abInvol
 	
 	if(abInvolvePlayer)
 		if(Event_PlayerInvolvedAssault.SendStoryEventAndWait(akTargetLocation, akRef1 = akCustomVerb, aiValue1 = aiType, aiValue2 = iReserveID))
+			_TraceAssaultPreparation(iReserveID, "WSFW Story Manager event returned")
 			int iWaitCount = 0
 			int iMaxWaitCount = 10
 			while( ! FindAssaultQuest(iReserveID) && iWaitCount < iMaxWaitCount)
@@ -284,11 +304,14 @@ Int Function SetupNewAssault(Location akTargetLocation, Int aiType, Bool abInvol
 			endWhile
 			
 			if(iWaitCount >= iMaxWaitCount) ; Failed to retrieve quest - let's not get stuck here
+				_TraceAssaultPreparation(iReserveID, "WSFW quest reservation failed", "Quest was not found after " + iWaitCount + " waits")
 				return -1 
 			endif
 			
+			_TraceAssaultPreparation(iReserveID, "WSFW quest reservation completed", "Waits: " + iWaitCount)
 			return iReserveID
 		else
+			_TraceAssaultPreparation(iReserveID, "WSFW quest reservation failed", "Story Manager event failed")
 			return -1
 		endif
 	else
@@ -311,6 +334,7 @@ EndFunction
 
 
 Bool Function SetupComplete(Int aiReserveID)
+	_TraceAssaultPreparation(aiReserveID, "WSFW SetupComplete started")
 	Quest kQuestRef = FindAssaultQuest(aiReserveID)
 	
 	if(kQuestRef)
@@ -318,16 +342,18 @@ Bool Function SetupComplete(Int aiReserveID)
 		
 		if(asAssaultQuest)
 			asAssaultQuest.SetupAssault()
-			
+			_TraceAssaultPreparation(aiReserveID, "WSFW SetupComplete finished")
 			return true
 		endif
 	endif
 	
+	_TraceAssaultPreparation(aiReserveID, "WSFW SetupComplete failed", "Assault quest was not available")
 	return false
 EndFunction
 
 
 Function StartAssault(Int aiReserveID) ; Trigger the attack to begin
+	_TraceAssaultPreparation(aiReserveID, "WSFW StartAssault requested")
 	Quest kQuestRef = FindAssaultQuest(aiReserveID)
 	
 	if(kQuestRef)
@@ -335,6 +361,7 @@ Function StartAssault(Int aiReserveID) ; Trigger the attack to begin
 		
 		if(asAssaultQuest)
 			asAssaultQuest.StartAssault()
+			_TraceAssaultPreparation(aiReserveID, "WSFW StartAssault returned")
 		endif
 	endif
 EndFunction
@@ -494,9 +521,15 @@ Bool Function SetupAttackers(int aiReserveID, Faction aAttackingFaction = None, 
 EndFunction
 
 Bool Function SetupAttackersV2(int aiReserveID, Faction aAttackingFaction = None, AssaultSpawnCount[] aSpawnAttackers = None, RefCollectionAlias aOtherAttackers = None)
+	Int iOtherAttackerCount = 0
+	if(aOtherAttackers != None)
+		iOtherAttackerCount = aOtherAttackers.GetCount()
+	endif
+	_TraceAssaultPreparation(aiReserveID, "WSFW attacker assignment started", "Collection count: " + iOtherAttackerCount)
 	Quest kQuestRef = FindAssaultQuest(aiReserveID)
 	
 	if( ! kQuestRef)
+		_TraceAssaultPreparation(aiReserveID, "WSFW attacker assignment failed", "Assault quest was not available")
 		return false
 	endif
 	
@@ -512,9 +545,11 @@ Bool Function SetupAttackersV2(int aiReserveID, Faction aAttackingFaction = None
 		asAssaultQuest.OtherAttackers = aOtherAttackers
 		asAssaultQuest.AttackingFaction = aAttackingFaction
 	else
+		_TraceAssaultPreparation(aiReserveID, "WSFW attacker assignment failed", "Quest did not cast to AssaultSettlement")
 		return false
 	endif
 	
+	_TraceAssaultPreparation(aiReserveID, "WSFW attacker assignment completed", "Collection count: " + iOtherAttackerCount)
 	return true
 EndFunction
 
@@ -532,9 +567,15 @@ Bool Function SetupDefenders(int aiReserveID, Faction aDefendingFaction = None, 
 EndFunction
 
 Bool Function SetupDefendersV2(int aiReserveID, Faction aDefendingFaction = None, AssaultSpawnCount[] aSpawnDefenders = None, RefCollectionAlias aOtherDefenders = None)
+	Int iOtherDefenderCount = 0
+	if(aOtherDefenders != None)
+		iOtherDefenderCount = aOtherDefenders.GetCount()
+	endif
+	_TraceAssaultPreparation(aiReserveID, "WSFW defender assignment started", "Collection count: " + iOtherDefenderCount)
 	Quest kQuestRef = FindAssaultQuest(aiReserveID)
 	
 	if( ! kQuestRef)
+		_TraceAssaultPreparation(aiReserveID, "WSFW defender assignment failed", "Assault quest was not available")
 		return false
 	endif
 	
@@ -550,9 +591,11 @@ Bool Function SetupDefendersV2(int aiReserveID, Faction aDefendingFaction = None
 		asAssaultQuest.OtherDefenders = aOtherDefenders
 		asAssaultQuest.DefendingFaction = aDefendingFaction
 	else
+		_TraceAssaultPreparation(aiReserveID, "WSFW defender assignment failed", "Quest did not cast to AssaultSettlement")
 		return false
 	endif
 	
+	_TraceAssaultPreparation(aiReserveID, "WSFW defender assignment completed", "Collection count: " + iOtherDefenderCount)
 	return true
 EndFunction
 
@@ -717,4 +760,18 @@ Bool Function IsSettlementInvolvedInAssault(WorkshopScript akWorkshopRef)
 	endWhile
 	
 	return false
+EndFunction
+
+
+Function ClearStoppedAssaultAliases()
+	; Clean up anything left in aliases by assaults that ended before this fix was installed
+	int i = 0
+	while(i < DefaultAssaultQuests.Length)
+		WorkshopFramework:AssaultSettlement thisAssault = DefaultAssaultQuests[i] as WorkshopFramework:AssaultSettlement
+		if(thisAssault && ! thisAssault.IsRunning())
+			thisAssault.ClearAssaultAliases()
+		endif
+
+		i += 1
+	endWhile
 EndFunction

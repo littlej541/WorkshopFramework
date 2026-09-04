@@ -124,21 +124,21 @@ Function Add(WorkshopScript akWorkshopRef = None)
 		endif
 	endif
 	
+	; Confirm all arrays are initialized
+	if(akWorkshopRef.AppliedLayouts == None)
+		akWorkshopRef.AppliedLayouts = new WorkshopFramework:Weapons:SettlementLayout[0]
+	endif
+
+	if(akWorkshopRef.LayoutScrappingComplete == None)
+		akWorkshopRef.LayoutScrappingComplete = new Bool[0]
+	endif
+
+	if(akWorkshopRef.LayoutPlacementComplete == None)
+		akWorkshopRef.LayoutPlacementComplete = new Bool[0]
+	endif
+
 	; Add to array on workshop ref
 	if(akWorkshopRef.AppliedLayouts.Find(Self) < 0)
-		; Confirm all arrays are initialized
-		if(akWorkshopRef.AppliedLayouts == None)
-			akWorkshopRef.AppliedLayouts = new WorkshopFramework:Weapons:SettlementLayout[0]
-		endif
-		
-		if(akWorkshopRef.LayoutScrappingComplete == None)
-			akWorkshopRef.LayoutScrappingComplete = new Bool[0]
-		endif
-		
-		if(akWorkshopRef.LayoutPlacementComplete == None)
-			akWorkshopRef.LayoutPlacementComplete = new Bool[0]
-		endif
-		
 		akWorkshopRef.AppliedLayouts.Add(Self)
 		akWorkshopRef.LayoutScrappingComplete.Add(false)
 		akWorkshopRef.LayoutPlacementComplete.Add(false)
@@ -193,7 +193,7 @@ Function RestoreVanillaObjects(WorkshopScript akWorkshopRef)
 			kThread.AddTagAVSet(LayoutIndexTypeAV, POWERCONNECTIONTYPE_VANILLA)
 						
 			if(RestoreVanillaObjectThreadLastCall(kThread))
-				ThreadManager.QueueThread(kThread)
+				ThreadManager.QueueThreadDurable(kThread)
 			endif
 		endif
 				
@@ -213,9 +213,19 @@ Int Function PlaceWorkshopResources(WorkshopScript akWorkshopRef, Int aiCustomCa
 EndFunction
 
 
+Int Function PlaceWorkshopResourcesV2(WorkshopScript akWorkshopRef, Int aiCustomCallbackID = -1, Bool abProtectFromScrapPhase = false, Int aiOperationID = -1, Keyword akTrackingKeyword = None)
+	return PlaceObjectsV2(akWorkshopRef, iGroupType_WorkshopResources, aiCustomCallbackID, abProtectFromScrapPhase, aiOperationID, akTrackingKeyword)
+EndFunction
+
+
 Int Function PlaceNonResourceObjects(WorkshopScript akWorkshopRef, Int aiCustomCallbackID = -1, Bool abProtectFromScrapPhase = false)
 	; Defining here instead of manager to allow extension
 	return PlaceObjects(akWorkshopRef, iGroupType_NonResources, aiCustomCallbackID, abProtectFromScrapPhase)
+EndFunction
+
+
+Int Function PlaceNonResourceObjectsV2(WorkshopScript akWorkshopRef, Int aiCustomCallbackID = -1, Bool abProtectFromScrapPhase = false, Int aiOperationID = -1, Keyword akTrackingKeyword = None)
+	return PlaceObjectsV2(akWorkshopRef, iGroupType_NonResources, aiCustomCallbackID, abProtectFromScrapPhase, aiOperationID, akTrackingKeyword)
 EndFunction
 
 
@@ -1572,6 +1582,11 @@ EndFunction
 
 
 Int Function PlaceObjects(WorkshopScript akWorkshopRef, Int aiObjectsGroupType, Int aiCustomCallbackID = -1, Bool abProtectFromScrapPhase = false)
+	return PlaceObjectsV2(akWorkshopRef, aiObjectsGroupType, aiCustomCallbackID, abProtectFromScrapPhase)
+EndFunction
+
+
+Int Function PlaceObjectsV2(WorkshopScript akWorkshopRef, Int aiObjectsGroupType, Int aiCustomCallbackID = -1, Bool abProtectFromScrapPhase = false, Int aiOperationID = -1, Keyword akTrackingKeyword = None)
 	if(akWorkshopRef == None)
 		return 0
 	endif
@@ -1782,10 +1797,24 @@ Int Function PlaceObjects(WorkshopScript akWorkshopRef, Int aiObjectsGroupType, 
 					endif
 				endif
 				
+				if(aiOperationID > 0 && akTrackingKeyword)
+					kThread.ConfigureDurableTracking(akWorkshopRef, akTrackingKeyword, aiOperationID, aiCustomCallbackID)
+					kThread.kDurableLayout = Self
+					kThread.iDurableItemIndex = i
+					kThread.iDurableItemGroup = aiObjectsGroupType
+				endif
+
 				if(PlaceObjectThreadLastCall(kThread))
-					ThreadManager.QueueThread(kThread, sPlaceObjectCallbackID)
-					
-					iThreadsStarted += 1
+					if(aiOperationID > 0 && akTrackingKeyword)
+						if(SettlementLayoutManager.RegisterLayoutWorker(kThread, akWorkshopRef, aiOperationID, aiCustomCallbackID))
+							iThreadsStarted += 1
+						endif
+					else
+						ThreadManager.QueueThread(kThread, sPlaceObjectCallbackID)
+						iThreadsStarted += 1
+					endif
+				elseif(aiOperationID > 0 && akTrackingKeyword)
+					kThread.FinishDurableTracking()
 				endif				
 			endif
 		endif
@@ -1828,7 +1857,7 @@ Int Function RemoveVanillaObjects(WorkshopScript akWorkshopRef, Bool abCallbacks
 			endif
 			
 			if(RemoveVanillaObjectThreadLastCall(kThread))
-				ThreadManager.QueueThread(kThread, sCallbackID)
+				ThreadManager.QueueThreadDurable(kThread, sCallbackID)
 				iThreadsStarted += 1
 			endif
 		endif
@@ -1870,7 +1899,7 @@ Int Function RemoveLayoutObjects(WorkshopScript akWorkshopRef, Bool abCallbacksN
 				
 				if(RemoveLayoutObjectThreadLastCall(kThread))	
 					iThreadsStarted += 1
-					ThreadManager.QueueThread(kThread, sCallbackID)
+					ThreadManager.QueueThreadDurable(kThread, sCallbackID)
 				endif
 			endif
 		endif
@@ -1897,7 +1926,7 @@ Int Function RemoveLayoutObjects(WorkshopScript akWorkshopRef, Bool abCallbacksN
 				
 				if(RemoveLayoutObjectThreadLastCall(kThread))	
 					iThreadsStarted += 1
-					ThreadManager.QueueThread(kThread, sCallbackID)
+					ThreadManager.QueueThreadDurable(kThread, sCallbackID)
 				endif
 			endif
 		endif

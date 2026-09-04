@@ -87,6 +87,10 @@ Auto State NotInitialized
 	Int Function QueueThread(WorkshopFramework:Library:ObjectRefs:Thread akThreadRef, String asMyCallbackID = "")
 		return NOTREADY
 	EndFunction
+
+	Int Function QueueThreadDurable(WorkshopFramework:Library:ObjectRefs:Thread akThreadRef, String asMyCallbackID = "")
+		return NOTREADY
+	EndFunction
 EndState
 
 
@@ -329,6 +333,26 @@ Int Function QueueThread(WorkshopFramework:Library:ObjectRefs:Thread akThreadRef
 	
 	thisRunner.CallFunctionNoWait("HandleNewThread", kArgs)
 	
+	return iCallbackID
+EndFunction
+
+Int Function QueueThreadDurable(WorkshopFramework:Library:ObjectRefs:Thread akThreadRef, String asMyCallbackID = "")
+	int iRunnerIndex = GetNextThreadRunner()
+
+	if(iRunnerIndex < 0 || ! akThreadRef)
+		return QUEUEFAIL
+	endif
+
+	int iCallbackID = NextCallbackID
+	akThreadRef.iCallbackID = iCallbackID
+	akThreadRef.sCustomCallbackID = asMyCallbackID
+
+	WorkshopFramework:Library:ThreadRunner thisRunner = ThreadRunners[iRunnerIndex]
+	if( ! thisRunner.QueueDurableThread(akThreadRef))
+		gThreadRunnerQueueCounts[iRunnerIndex].Mod(-1)
+		return QUEUEFAIL
+	endif
+
 	return iCallbackID
 EndFunction
 

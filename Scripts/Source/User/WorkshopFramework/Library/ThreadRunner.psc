@@ -22,6 +22,10 @@ import WorkshopFramework:Library:UtilityFunctions
 
 Float NULLARGUMENT = -1522753.0 Const ; Copied from ThreadManager
 Int OVERLOADTHRESHOLD = 20 Const ; Copied from ThreadManager
+Int iTimerID_QueuePump = 1 Const
+Float fQueuePumpInterval = 5.0 Const
+Float fThreadStartTimeout = 30.0 Const
+Float fThreadRunTimeout = 300.0 Const
 
 ; ---------------------------------------------
 ; Custom Events
@@ -267,6 +271,9 @@ EndFunction
 ; ---------------------------------------------
 
 int iRunningThreads = 0
+WorkshopFramework:Library:ObjectRefs:Thread kRunningThread
+Float fRunningThreadStartTime = 0.0
+Bool bQueuePumpTimerRunning = false
 
 ; ---------------------------------------------
 ; States 
@@ -279,9 +286,14 @@ int iRunningThreads = 0
 
 Event WorkshopFramework:Library:ObjectRefs:Thread.ThreadRunComplete(WorkshopFramework:Library:ObjectRefs:Thread akThreadRef, Var[] akArgs)
 	UnregisterForCustomEvent(akThreadRef, "ThreadRunComplete")
-	CompleteRun(akArgs[0] as String, akArgs[1] as Int, akThreadRef)
-	iRunningThreads -= 1
-	TryToProcessNextQueuedThread()
+	HandleCompletedThread(akThreadRef)
+EndEvent
+
+Event OnTimer(Int aiTimerID)
+	if(aiTimerID == iTimerID_QueuePump)
+		bQueuePumpTimerRunning = false
+		PumpDurableQueue()
+	endif
 EndEvent
 
 
@@ -291,11 +303,16 @@ EndEvent
 
 Function HandleGameLoaded()
 	; Make sure the queue never gets stuck due to things like externally deleted threads, or mods using the threading engine being uninstalled
+	CancelTimer(iTimerID_QueuePump)
 	iRunningThreads = 0 
+	kRunningThread = None
+	fRunningThreadStartTime = 0.0
+	bQueuePumpTimerRunning = false
 	
 	Parent.HandleGameLoaded()
 	
 	TryToProcessNextQueuedThread()
+	StartQueuePumpTimer(fQueuePumpInterval)
 EndFunction
 ; ---------------------------------------------
 ; Functions
@@ -397,6 +414,32 @@ Function HandleNewThread(WorkshopFramework:Library:ObjectRefs:Thread akThreadRef
 	TryToProcessNextQueuedThread()
 EndFunction
 
+Bool Function QueueDurableThread(WorkshopFramework:Library:ObjectRefs:Thread akThreadRef)
+	if( ! akThreadRef)
+		return false
+	endif
+
+	if(QueuedThreads.Find(akThreadRef) < 0)
+		QueuedThreads.AddRef(akThreadRef)
+	endif
+
+	if(QueuedThreads.Find(akThreadRef) < 0)
+		return false
+	endif
+
+	akThreadRef.bDurableQueued = true
+	akThreadRef.fDurableQueueTime = Utility.GetCurrentRealTime()
+	StartQueuePumpTimer(0.1)
+	return true
+EndFunction
+
+Function StartQueuePumpTimer(Float afDelay)
+	if( ! bQueuePumpTimerRunning)
+		bQueuePumpTimerRunning = true
+		StartTimer(afDelay, iTimerID_QueuePump)
+	endif
+EndFunction
+
 
 Function TryToProcessNextQueuedThread()
 	if(iRunningThreads > 0)
@@ -425,11 +468,27 @@ Function TryToProcessNextQueuedThread()
 				if(kTemp != None && kTemp.GetBaseObject() != None && kTemp.GetBaseObject().GetFormID() != 0x00000000)
 					WorkshopFramework:Library:ObjectRefs:Thread thisThread = kTemp as WorkshopFramework:Library:ObjectRefs:Thread
 					
-					; Clear from queue - even if it isn't a thread object, should never happen, but just in case
-					QueuedThreads.RemoveRef(kTemp)
-					
 					if(thisThread && thisThread.IsBoundGameObjectAvailable())
-						ProcessThreadObject(thisThread)
+						if(thisThread.bDurableQueued)
+							if(thisThread.bThreadRunComplete)
+								HandleCompletedThreadV2(thisThread, false)
+							elseif(thisThread.bThreadRunStarted)
+								iRunningThreads = 1
+								kRunningThread = thisThread
+								fRunningThreadStartTime = thisThread.fThreadRunStartTime
+								if(fRunningThreadStartTime <= 0.0 || fRunningThreadStartTime > Utility.GetCurrentRealTime())
+									fRunningThreadStartTime = Utility.GetCurrentRealTime()
+									thisThread.fThreadRunStartTime = fRunningThreadStartTime
+								endif
+							else
+								ProcessThreadObject(thisThread)
+							endif
+						else
+							QueuedThreads.RemoveRef(kTemp)
+							ProcessThreadObject(thisThread)
+						endif
+					else
+						QueuedThreads.RemoveRef(kTemp)
 					endif
 				endif
 				
@@ -447,7 +506,81 @@ EndFunction
 
 Function ProcessThreadObject(WorkshopFramework:Library:ObjectRefs:Thread akThreadRef)
 	iRunningThreads += 1
+	kRunningThread = akThreadRef
+	fRunningThreadStartTime = Utility.GetCurrentRealTime()
 	RegisterForCustomEvent(akThreadRef, "ThreadRunComplete")
 	Var[] kArgs = new Var[0]
 	akThreadRef.CallFunctionNoWait("StartThread", kArgs)	
+EndFunction
+
+Function HandleCompletedThread(WorkshopFramework:Library:ObjectRefs:Thread akThreadRef)
+	HandleCompletedThreadV2(akThreadRef)
+EndFunction
+
+
+Function HandleCompletedThreadV2(WorkshopFramework:Library:ObjectRefs:Thread akThreadRef, Bool abProcessNext = true)
+	if( ! akThreadRef)
+		return
+	endif
+
+	Bool bAwaitingDurableCredit = akThreadRef.bDurableQueued && akThreadRef.sCustomCallbackID != "" && ! akThreadRef.bDurableCredited
+	if(akThreadRef.bDurableQueued && ! bAwaitingDurableCredit)
+		QueuedThreads.RemoveRef(akThreadRef)
+		akThreadRef.bDurableQueued = false
+	endif
+
+	if( ! akThreadRef.bRunnerCompletionHandled)
+		akThreadRef.bRunnerCompletionHandled = true
+		CompleteRun(akThreadRef.sCustomCallbackID, akThreadRef.iCallBackID, akThreadRef)
+	elseif(bAwaitingDurableCredit)
+		Var[] kResultArgs = new Var[3]
+		kResultArgs[0] = akThreadRef.sCustomCallbackID
+		kResultArgs[1] = akThreadRef.iCallBackID
+		kResultArgs[2] = akThreadRef
+		SendCustomEvent("OnThreadCompleted", kResultArgs)
+	endif
+
+	if(bAwaitingDurableCredit)
+		StartQueuePumpTimer(fQueuePumpInterval)
+		return
+	endif
+
+	if(kRunningThread == akThreadRef)
+		iRunningThreads -= 1
+		if(iRunningThreads < 0)
+			iRunningThreads = 0
+		endif
+
+		kRunningThread = None
+		fRunningThreadStartTime = 0.0
+	endif
+
+	if(abProcessNext)
+		TryToProcessNextQueuedThread()
+	endif
+	if(iRunningThreads > 0 || QueuedThreads.GetCount() > 0)
+		StartQueuePumpTimer(fQueuePumpInterval)
+	endif
+EndFunction
+
+Function PumpDurableQueue()
+	if(kRunningThread)
+		Float fElapsed = Utility.GetCurrentRealTime() - fRunningThreadStartTime
+		if(kRunningThread.bThreadRunComplete)
+			HandleCompletedThread(kRunningThread)
+		elseif(( ! kRunningThread.bThreadRunStarted && fElapsed >= fThreadStartTimeout) || fElapsed >= fThreadRunTimeout)
+			WorkshopFramework:Library:ObjectRefs:Thread kRetryThread = kRunningThread
+			UnregisterForCustomEvent(kRetryThread, "ThreadRunComplete")
+			kRunningThread = None
+			fRunningThreadStartTime = 0.0
+			iRunningThreads = 0
+			kRetryThread.PrepareDurableRetry()
+			QueueDurableThread(kRetryThread)
+		endif
+	endif
+
+	TryToProcessNextQueuedThread()
+	if(iRunningThreads > 0 || QueuedThreads.GetCount() > 0)
+		StartQueuePumpTimer(fQueuePumpInterval)
+	endif
 EndFunction

@@ -56,6 +56,7 @@ float Property fTimerLength_FailsafeNoSetup = 300.0 autoReadOnly ; After 5 minut
 float Property fTimerLength_EnemyMonitor = 45.0 autoReadOnly
 
 String sLogName = "WSFWAssault" Const
+String sAssaultPreparationLogName = "SS2AssaultPreparation" Const
 ; -------------------------------------------
 ; Editor Properties
 ; -------------------------------------------
@@ -156,6 +157,8 @@ Float Property fPlayerArriveDistance = 500.0 Auto Hidden
 Bool Property bDisabledMapMarker = false Auto Hidden
 Int Property iReserveID = -1 Auto Hidden
 Int Property iCurrentAssaultType = -1 Auto Hidden Conditional
+Float Property fAssaultCreatedGameTime = 0.0 Auto Hidden
+Float Property fLastAssaultProgressGameTime = 0.0 Auto Hidden
 
 Function UpdateCurrentAssaultType(Int aiType)
 	iCurrentAssaultType = aiType
@@ -234,6 +237,23 @@ Bool Property bEnemySurvivorsRemainEnemyToPlayer = true Auto Hidden
 Bool Property bFirstBloodSent = false Auto Hidden
 Bool Property bReinforcementsPhase = false Auto Hidden
 
+Actor[] Property ActorsGhostedForSetup Auto Hidden
+Actor[] Property ActorsHiddenForSetup Auto Hidden
+Int Property iSetupMoveIndex = 0 Auto Hidden
+Actor[] Property ActorsMovedForRecovery Auto Hidden
+Float[] Property ActorRecoveryMoveTimes Auto Hidden
+ObjectReference[] Property ActorRecoveryMovePoints Auto Hidden
+Actor[] Property ActorsMovedToCenterForRecovery Auto Hidden
+Actor[] Property ActorsMovedToSafeRecoveryPoint Auto Hidden
+ObjectReference[] Property SafeRecoveryMovePoints Auto Hidden
+
+Float fMoveProtectionTime = 2.0 Const
+Float fEnemyRecoveryFallbackTime = 90.0 Const
+Float fEnemyRecoveryCenterDistance = 3000.0 Const
+Float fEnemyRecoverySafePointMinPlayerDistance = 2000.0 Const
+Int iMaxCenterRecoveryMovesPerCheck = 2 Const
+Int iCenterRecoveryMovesThisCheck = 0
+
 ; TODO: Currently using just one faction for attack and one for defense means that if we ever have two opposing attacks (one with the player attacking and one with the player defending) happening simultaneously, the factions will be incorrectly matched. Likely need a different solution to this for aggression against the player.
 
 ; -------------------------------------------
@@ -245,9 +265,25 @@ Event OnStoryScript(Keyword akKeyword, Location akLocation, ObjectReference akRe
 	; aiValue1 = Type 
 	; aiValue2 = ReserveID
 	Debug.OpenUserLog(sLogName)
+	Debug.OpenUserLog(sAssaultPreparationLogName)
 	
+	Float fCurrentGameTime = Utility.GetCurrentGameTime()
+	fAssaultCreatedGameTime = fCurrentGameTime
+	fLastAssaultProgressGameTime = fCurrentGameTime
+
 	iLastStageSet = -1
 	fLastStageSetTimestamp = 0.0
+	_RestoreActorsAfterMove(ActorsGhostedForSetup)
+	_RestoreActorsHiddenForSetup()
+	ActorsGhostedForSetup = new Actor[0]
+	ActorsHiddenForSetup = new Actor[0]
+	iSetupMoveIndex = 0
+	ActorsMovedForRecovery = new Actor[0]
+	ActorRecoveryMoveTimes = new Float[0]
+	ActorRecoveryMovePoints = new ObjectReference[0]
+	ActorsMovedToCenterForRecovery = new Actor[0]
+	ActorsMovedToSafeRecoveryPoint = new Actor[0]
+	SafeRecoveryMovePoints = new ObjectReference[0]
 	
 	if(akRef1 != None)
 		VerbAlias.ForceRefTo(akRef1)
@@ -255,9 +291,13 @@ Event OnStoryScript(Keyword akKeyword, Location akLocation, ObjectReference akRe
 	
 	UpdateCurrentAssaultType(aiValue1)
 	iReserveID = aiValue2
+	_TraceAssaultPreparation("WSFW assault quest initialized", "Target: " + akLocation + "; type: " + aiValue1)
 	
 	ObjectReference kDefendFromRef = DefendFromAlias.GetRef()
-	ObjectReference kWorkshopRef = WorkshopAlias.GetRef()
+	ObjectReference kWorkshopRef = None
+	if(WorkshopAlias != None)
+		kWorkshopRef = WorkshopAlias.GetRef()
+	endif
 	
 	if(kDefendFromRef == kWorkshopRef || kDefendFromRef == None)
 		kDefendFromRef = GetFallbackDefendFromRef()
@@ -324,6 +364,11 @@ Event OnStageSet(Int aiStageID, Int aiItemID)
 	else
 		iLastStageSet = aiStageID
 		fLastStageSetTimestamp = fCurrentTime
+	endif
+
+	fLastAssaultProgressGameTime = Utility.GetCurrentGameTime()
+	if(aiStageID == iStage_Ready || aiStageID == iStage_PlayerArrived || aiStageID == iStage_Started || aiStageID == iStage_TriggerAI)
+		_TraceAssaultPreparation("WSFW assault stage set", "Stage: " + aiStageID)
 	endif
 	
 	if(aiStageID == iStage_Ready)
@@ -542,6 +587,16 @@ EndEvent
 ; ------------------------------------------- 
 ; Functions
 ; -------------------------------------------
+Function _TraceAssaultPreparation(String asPhase, String asDetails = "")
+	String sMessage = "[Reserve " + iReserveID + "][Time " + Utility.GetCurrentRealTime() + "] " + asPhase
+	if(asDetails != "")
+		sMessage += ". " + asDetails
+	endif
+
+	ModTraceCustom(sAssaultPreparationLogName, sMessage)
+EndFunction
+
+
 Function ForceOpenDebugLog()
 	Debug.OpenUserLog(sLogName)
 EndFunction
@@ -622,8 +677,211 @@ Bool Function TryToMarkSuccessful()
 EndFunction
 
 
+; KG 3.7.0 - Protect actors and spread them out so assault staging can't knock them into bleedout
+Bool Function _MoveActorForAssault(Actor akActorRef, ObjectReference akMoveToRef, Int aiPosition)
+	if(akActorRef == None || akMoveToRef == None)
+		return false
+	endif
+
+	Bool bRemoveGhost = false
+	if( ! akActorRef.IsGhost())
+		akActorRef.SetGhost(true)
+		bRemoveGhost = true
+	endif
+
+	Float fXOffset = ((aiPosition % 5) - 2) * 192.0
+	Float fYOffset = ((aiPosition / 5) - 1) * 192.0
+	akActorRef.MoveTo(akMoveToRef, fXOffset, fYOffset)
+
+	return bRemoveGhost
+EndFunction
+
+
+Function _MoveActorForSetup(Actor akActorRef, ObjectReference akMoveToRef)
+	if(ActorsGhostedForSetup == None)
+		ActorsGhostedForSetup = new Actor[0]
+	endif
+
+	if(_MoveActorForAssault(akActorRef, akMoveToRef, iSetupMoveIndex))
+		ActorsGhostedForSetup.Add(akActorRef)
+	endif
+	_RecordEnemyRecoveryMoveV2(akActorRef, Utility.GetCurrentRealTime(), akMoveToRef)
+
+	iSetupMoveIndex += 1
+EndFunction
+
+
+; KG 3.7.0 - Let callers protect and hide actors during local prep so setup doesn't repeat the work before moving them
+Bool Function ProtectActorForSetupMove(Actor akActorRef)
+	if(akActorRef == None)
+		return false
+	endif
+
+	if(ActorsGhostedForSetup == None)
+		ActorsGhostedForSetup = new Actor[0]
+	endif
+	if(ActorsHiddenForSetup == None)
+		ActorsHiddenForSetup = new Actor[0]
+	endif
+
+	Bool bChangedActor = false
+	if( ! akActorRef.IsGhost())
+		akActorRef.SetGhost(true)
+		ActorsGhostedForSetup.Add(akActorRef)
+		bChangedActor = true
+	endif
+	if(ActorsHiddenForSetup.Find(akActorRef) < 0)
+		akActorRef.SetAlpha(0.0)
+		ActorsHiddenForSetup.Add(akActorRef)
+		;ModTraceCustom(sLogName, "ProtectActorForSetupMove: Set actor " + akActorRef + " alpha to 0 before local prep.")
+		bChangedActor = true
+	endif
+
+	return bChangedActor
+EndFunction
+
+
+Function _RestoreActorsAfterMove(Actor[] akActors, Bool abWaitForPhysics = false)
+	if(akActors == None || akActors.Length == 0)
+		return
+	endif
+
+	if(abWaitForPhysics)
+		Utility.Wait(fMoveProtectionTime)
+	endif
+
+	int i = 0
+	while(i < akActors.Length)
+		if(akActors[i] != None)
+			akActors[i].SetGhost(false)
+		endif
+
+		i += 1
+	endWhile
+EndFunction
+
+
+Function _RestoreActorsHiddenForSetup()
+	if(ActorsHiddenForSetup == None || ActorsHiddenForSetup.Length == 0)
+		return
+	endif
+
+	int i = 0
+	while(i < ActorsHiddenForSetup.Length)
+		if(ActorsHiddenForSetup[i] != None)
+			ActorsHiddenForSetup[i].SetAlpha(1.0)
+		endif
+
+		i += 1
+	endWhile
+EndFunction
+
+
+Function _RecordEnemyRecoveryMove(Actor akActorRef, Float afMoveTime)
+	_RecordEnemyRecoveryMoveV2(akActorRef, afMoveTime)
+EndFunction
+
+
+Function _MakeSureRecoveryTrackingReady()
+	if(ActorsMovedForRecovery == None || ActorRecoveryMoveTimes == None || ActorRecoveryMovePoints == None || ActorsMovedForRecovery.Length != ActorRecoveryMoveTimes.Length || ActorsMovedForRecovery.Length != ActorRecoveryMovePoints.Length)
+		ActorsMovedForRecovery = new Actor[0]
+		ActorRecoveryMoveTimes = new Float[0]
+		ActorRecoveryMovePoints = new ObjectReference[0]
+		ActorsMovedToCenterForRecovery = new Actor[0]
+		ActorsMovedToSafeRecoveryPoint = new Actor[0]
+	endif
+	if(ActorsMovedToCenterForRecovery == None)
+		ActorsMovedToCenterForRecovery = new Actor[0]
+	endif
+	if(ActorsMovedToSafeRecoveryPoint == None)
+		ActorsMovedToSafeRecoveryPoint = new Actor[0]
+	endif
+	if(SafeRecoveryMovePoints == None)
+		SafeRecoveryMovePoints = new ObjectReference[0]
+	endif
+EndFunction
+
+
+Function _RecordEnemyRecoveryMoveV2(Actor akActorRef, Float afMoveTime, ObjectReference akMoveToRef = None)
+	if(akActorRef == None)
+		return
+	endif
+
+	_MakeSureRecoveryTrackingReady()
+
+	Int iRecoveryIndex = ActorsMovedForRecovery.Find(akActorRef)
+	if(iRecoveryIndex < 0)
+		ActorsMovedForRecovery.Add(akActorRef)
+		ActorRecoveryMoveTimes.Add(afMoveTime)
+		ActorRecoveryMovePoints.Add(akMoveToRef)
+	else
+		ActorRecoveryMoveTimes[iRecoveryIndex] = afMoveTime
+		ActorRecoveryMovePoints[iRecoveryIndex] = akMoveToRef
+	endif
+
+	Int iCenterIndex = ActorsMovedToCenterForRecovery.Find(akActorRef)
+	if(iCenterIndex >= 0)
+		ActorsMovedToCenterForRecovery.Remove(iCenterIndex)
+	endif
+
+	Int iSafeIndex = ActorsMovedToSafeRecoveryPoint.Find(akActorRef)
+	if(iSafeIndex >= 0)
+		ActorsMovedToSafeRecoveryPoint.Remove(iSafeIndex)
+	endif
+EndFunction
+
+
+Function MoveRefCollectionToAssaultPoint(RefCollectionAlias akCollection, ObjectReference akMoveToRef)
+	if(akCollection == None || akMoveToRef == None)
+		return
+	endif
+
+	Actor[] ActorsToRestore = new Actor[0]
+	Float fMoveTime = Utility.GetCurrentRealTime()
+	int i = 0
+	while(i < akCollection.GetCount())
+		Actor thisActor = akCollection.GetAt(i) as Actor
+		if(_MoveActorForAssault(thisActor, akMoveToRef, i))
+			ActorsToRestore.Add(thisActor)
+		endif
+		_RecordEnemyRecoveryMoveV2(thisActor, fMoveTime, akMoveToRef)
+
+		i += 1
+	endWhile
+
+	_RestoreActorsAfterMove(ActorsToRestore, abWaitForPhysics = true)
+EndFunction
+
+
+Function MoveActorsToAssaultPoint(Actor[] akActors, ObjectReference akMoveToRef, Bool abMoveToNearestNavmesh = false)
+	if(akActors == None || akActors.Length == 0 || akMoveToRef == None)
+		return
+	endif
+
+	Actor[] ActorsToRestore = new Actor[0]
+	Float fMoveTime = Utility.GetCurrentRealTime()
+	Bool bMoveToNavmesh = abMoveToNearestNavmesh && akMoveToRef.Is3DLoaded()
+	int i = 0
+	while(i < akActors.Length)
+		Actor thisActor = akActors[i]
+		if(_MoveActorForAssault(thisActor, akMoveToRef, i))
+			ActorsToRestore.Add(thisActor)
+		endif
+		if(thisActor != None && bMoveToNavmesh)
+			thisActor.MoveToNearestNavmeshLocation()
+		endif
+		_RecordEnemyRecoveryMoveV2(thisActor, fMoveTime, akMoveToRef)
+
+		i += 1
+	endWhile
+
+	_RestoreActorsAfterMove(ActorsToRestore, abWaitForPhysics = true)
+EndFunction
+
+
 Function SetupAssault()
 	CancelTimer(iTimerID_AutoRunSetup)
+	_TraceAssaultPreparation("WSFW assault setup started")
 	
 	; Setup map marker and fast travel
 	SetupMapMarker(true)
@@ -747,6 +1005,7 @@ Function SetupAssault()
 			i += 1
 		endWhile
 	endif
+	_TraceAssaultPreparation("WSFW defender alias and spawn setup completed", "Defenders: " + Defenders.GetCount())
 	
 	; Setup attackers outside of the settlement somewhere
 	ObjectReference kAttackFrom = AttackFromAlias.GetRef()
@@ -756,7 +1015,7 @@ Function SetupAssault()
 	while(i < SpawnedAttackersAlias.GetCount())
 		Actor thisActor = SpawnedAttackersAlias.GetAt(i) as Actor
 		if(thisActor)
-			thisActor.MoveTo(kAttackFrom)
+			_MoveActorForSetup(thisActor, kAttackFrom)
 		endif
 		
 		i += 1
@@ -797,7 +1056,7 @@ Function SetupAssault()
 				if(thisActor)
 					; Move OtherAttackers into position
 					if(bMoveAttackersToStartPoint)
-						thisActor.MoveTo(kAttackFrom)
+						_MoveActorForSetup(thisActor, kAttackFrom)
 					endif
 				endif
 				
@@ -805,6 +1064,7 @@ Function SetupAssault()
 			endWhile			
 		endif
 	endif
+	_TraceAssaultPreparation("WSFW attacker alias and spawn setup completed", "Attackers: " + Attackers.GetCount())
 		
 	; 2.3.5 - Make sure attackers aren't in WorkshopNPCFaction or the settlement's ownership faction or they won't be hostile to defenders
 	RemoveSettlementFactionsFromCollection(AttackerFactionAlias)
@@ -855,8 +1115,15 @@ Function SetupAssault()
 	if(KillToComplete.GetCount() == 0)
 		SetStage(iStage_AllEnemiesDead)
 	endif
+	_TraceAssaultPreparation("WSFW victory and player-side aliases completed", "Kill targets: " + KillToComplete.GetCount() + "; subdue targets: " + SubdueToComplete.GetCount())
+
+	_RestoreActorsAfterMove(ActorsGhostedForSetup, abWaitForPhysics = true)
+	_RestoreActorsHiddenForSetup()
+	ActorsGhostedForSetup = new Actor[0]
+	ActorsHiddenForSetup = new Actor[0]
 	
 	SetStage(iStage_Ready)
+	_TraceAssaultPreparation("WSFW assault setup completed", "Attackers: " + Attackers.GetCount() + "; defenders: " + Defenders.GetCount())
 	
 	if(bAutoStartAssaultOnLoad)
 		Location thisLocation = TargetLocationAlias.GetLocation()
@@ -882,6 +1149,7 @@ Function SpawnDefenders(ActorBase aSpawnMe, Int aiSpawnCount, ObjectReference ak
 		Actor kDefenderRef = akSpawnAt.PlaceActorAtMe(aSpawnMe)
 		
 		if(kDefenderRef)
+			_MoveActorForSetup(kDefenderRef, akSpawnAt)
 			SetupSpawnedDefender(kDefenderRef)
 		endif
 		
@@ -896,6 +1164,7 @@ Function SpawnAttackers(ActorBase aSpawnMe, Int aiSpawnCount, ObjectReference ak
 		Actor kAttackerRef = akSpawnAt.PlaceActorAtMe(aSpawnMe)
 		
 		if(kAttackerRef)
+			_MoveActorForSetup(kAttackerRef, akSpawnAt)
 			SetupSpawnedAttacker(kAttackerRef)
 		endif
 		
@@ -1086,6 +1355,7 @@ EndFunction
 
 
 Function StartAssault()
+	_TraceAssaultPreparation("WSFW assault start handling began")
 	if(GetStageDone(iStage_Ready) && ! GetStageDone(iStage_Started))
 		SetStage(iStage_Started)
 		SetStage(iStage_TriggerAI)		
@@ -1093,6 +1363,9 @@ Function StartAssault()
 		AssaultManager.AssaultStarted_Private(Self, WorkshopAlias.GetRef(), iCurrentAssaultType, AttackingFaction, DefendingFaction)
 		
 		ConfigureTurrets(abMakeDefenders = true)
+		_TraceAssaultPreparation("WSFW assault start handling completed")
+	else
+		_TraceAssaultPreparation("WSFW assault start handling skipped", "Ready: " + GetStageDone(iStage_Ready) + "; started: " + GetStageDone(iStage_Started))
 	endif
 EndFunction
 
@@ -1386,6 +1659,7 @@ EndFunction
 
 
 Function StartAIPackages()
+	_TraceAssaultPreparation("WSFW combat AI setup started")
 	if(bPlayerInvolved)
 		if(iCurrentAssaultType == AssaultManager.iType_Defend)
 			AssaultAttackersFaction.SetPlayerEnemy(true)
@@ -1411,12 +1685,14 @@ Function StartAIPackages()
 	
 	Attackers.EvaluateAll()	
 	Defenders.EvaluateAll()
+	_TraceAssaultPreparation("WSFW combat AI setup completed", "Attackers: " + Attackers.GetCount() + "; defenders: " + Defenders.GetCount())
 EndFunction
 
 
 Function AddCollectionToCompleteAliases(RefCollectionAlias aCollection, Bool abDefenders = false, Bool abGuardNPCs = false)
 	int i = 0
 	int iCount = aCollection.GetCount()
+	_TraceAssaultPreparation("WSFW collection alias processing started", "Collection: " + aCollection + "; count: " + iCount + "; defenders: " + abDefenders)
 	ObjectReference kDefendFromRef = DefendFromAlias.GetRef()
 	ObjectReference kAttackFromRef = AttackFromAlias.GetRef()
 	
@@ -1428,9 +1704,6 @@ Function AddCollectionToCompleteAliases(RefCollectionAlias aCollection, Bool abD
 			kAttackFromRef = kLinkedHeadingRef
 		endif
 	endif
-	
-	Bool bIsDefendFromLoaded = kDefendFromRef.Is3dLoaded()
-	Bool bIsAttackFromLoaded = kAttackFromRef.Is3dLoaded()
 	
 	while(i < iCount)
 		Actor thisActor = aCollection.GetAt(i) as Actor
@@ -1445,21 +1718,14 @@ Function AddCollectionToCompleteAliases(RefCollectionAlias aCollection, Bool abD
 			
 			if( ! bSkipActor)
 				; Move units
+				; KG 3.7.0 - Movement options should not adjust actors when disabled
 				if(abDefenders)
 					if(bMoveDefendersToCenterPoint)
-						thisActor.MoveTo(kDefendFromRef)
-					endif
-					
-					if(bIsDefendFromLoaded)
-						thisActor.MoveToNearestNavmeshLocation()
+						_MoveActorForSetup(thisActor, kDefendFromRef)
 					endif
 				elseif( ! abDefenders)
 					if(bMoveAttackersToStartPoint)
-						thisActor.MoveTo(kAttackFromRef)
-					endif
-					
-					if(bIsAttackFromLoaded)
-						thisActor.MoveToNearestNavmeshLocation()
+						_MoveActorForSetup(thisActor, kAttackFromRef)
 					endif
 				endif
 			endif 
@@ -1482,6 +1748,7 @@ Function AddCollectionToCompleteAliases(RefCollectionAlias aCollection, Bool abD
 		
 		i += 1
 	endWhile
+	_TraceAssaultPreparation("WSFW collection alias processing completed", "Collection: " + aCollection + "; count: " + iCount)
 EndFunction
 
 
@@ -1659,6 +1926,16 @@ EndFunction
 
 Function CleanupAssault()
 	WorkshopScript thisWorkshop = WorkshopAlias.GetRef() as WorkshopScript
+	_RestoreActorsAfterMove(ActorsGhostedForSetup)
+	_RestoreActorsHiddenForSetup()
+	ActorsGhostedForSetup = new Actor[0]
+	ActorsHiddenForSetup = new Actor[0]
+	ActorsMovedForRecovery = new Actor[0]
+	ActorRecoveryMoveTimes = new Float[0]
+	ActorRecoveryMovePoints = new ObjectReference[0]
+	ActorsMovedToCenterForRecovery = new Actor[0]
+	ActorsMovedToSafeRecoveryPoint = new Actor[0]
+	SafeRecoveryMovePoints = new ObjectReference[0]
 	
 	if(Attackers != None)
 		Attackers.RemoveFromFaction(ActivateAIFaction) ; Clear attack AI
@@ -1784,6 +2061,40 @@ Function CleanupAssault()
 	
 	; 1.1.9 - Moved this to the last thing
 	RestoreBleedoutRecovery()
+
+	ClearAssaultAliases()
+EndFunction
+
+
+Function ClearAssaultAliases()
+	; Make sure nothing from this assault remains persistent if the quest reset fails to clear an alias
+	KillToComplete.RemoveAll()
+	SubdueToComplete.RemoveAll()
+	PlayerAllies.RemoveAll()
+	PlayerEnemies.RemoveAll()
+	StartingAttackers.RemoveAll()
+	StartingDefenders.RemoveAll()
+	ReinforcementAttackers.RemoveAll()
+	ReinforcementDefenders.RemoveAll()
+	Defenders.RemoveAll()
+	Attackers.RemoveAll()
+	SpawnedAttackersAlias.RemoveAll()
+	SpawnedDefendersAlias.RemoveAll()
+	AttackerFactionAlias.RemoveAll()
+	DefenderFactionAlias.RemoveAll()
+	Settlers.RemoveAll()
+	Synths.RemoveAll()
+	NonSpeakingSettlers.RemoveAll()
+	Robots.RemoveAll()
+	Children.RemoveAll()
+
+	SettlementLeader.Clear()
+	VerbAlias.Clear()
+	AttackFromAlias.Clear()
+	DefendFromAlias.Clear()
+	MapMarkerAlias.Clear()
+	WorkshopAlias.Clear()
+	CenterMarkerAlias.Clear()
 EndFunction
 
 
@@ -1970,6 +2281,147 @@ ObjectReference Function GetFallbackDefendFromRef()
 	return kDefendFromRef
 EndFunction
 
+Bool Function _IsFightingOpposingAssaultActor(Actor akActorRef)
+	Actor kCombatTarget = akActorRef.GetCombatTarget()
+	if(kCombatTarget == None)
+		return false
+	endif
+
+	if(AttackerFactionAlias.Find(akActorRef) >= 0)
+		return DefenderFactionAlias.Find(kCombatTarget) >= 0
+	elseif(DefenderFactionAlias.Find(akActorRef) >= 0)
+		return AttackerFactionAlias.Find(kCombatTarget) >= 0
+	endif
+
+	return false
+EndFunction
+
+
+Function _MarkRecoveryMovePointSafe(Actor akActorRef, Int aiRecoveryIndex)
+	ObjectReference kMovePoint = ActorRecoveryMovePoints[aiRecoveryIndex]
+	if(kMovePoint != None && SafeRecoveryMovePoints.Find(kMovePoint) < 0)
+		SafeRecoveryMovePoints.Add(kMovePoint)
+		ModTraceCustom(sLogName, "          Actor " + akActorRef + " joined the assault from " + kMovePoint + ". Marking it as a safe recovery point.")
+	endif
+
+	if(ActorsMovedToCenterForRecovery.Find(akActorRef) < 0)
+		ActorsMovedToCenterForRecovery.Add(akActorRef)
+	endif
+EndFunction
+
+
+ObjectReference Function _GetSafeRecoveryMovePoint(Actor akPlayerRef, ObjectReference akFailedMovePoint = None)
+	ObjectReference kBestPoint = None
+	Float fBestDistance = -1.0
+	int i = 0
+	while(i < SafeRecoveryMovePoints.Length)
+		ObjectReference thisPoint = SafeRecoveryMovePoints[i]
+		if(thisPoint != None && thisPoint != akFailedMovePoint)
+			Float fPlayerDistance = thisPoint.GetDistance(akPlayerRef)
+			if(fPlayerDistance >= fEnemyRecoverySafePointMinPlayerDistance && fPlayerDistance > fBestDistance)
+				kBestPoint = thisPoint
+				fBestDistance = fPlayerDistance
+			endif
+		endif
+
+		i += 1
+	endWhile
+
+	; KG 3.7.0 - Retry the same point if another wave already proved it works
+	if(kBestPoint == None && akFailedMovePoint != None && SafeRecoveryMovePoints.Find(akFailedMovePoint) >= 0 && akFailedMovePoint.GetDistance(akPlayerRef) >= fEnemyRecoverySafePointMinPlayerDistance)
+		kBestPoint = akFailedMovePoint
+	endif
+
+	return kBestPoint
+EndFunction
+
+
+Bool Function _HasSafeRecoveryMovePoint()
+	int i = 0
+	while(i < SafeRecoveryMovePoints.Length)
+		if(SafeRecoveryMovePoints[i] != None)
+			return true
+		endif
+
+		i += 1
+	endWhile
+
+	return false
+EndFunction
+
+
+; KG 3.7.0 - Try a point that worked earlier in the assault before moving anyone to the center
+Bool Function _TryToRecoverEnemy(Actor akActorRef, Actor akPlayerRef, ObjectReference akMoveToRef, ObjectReference akCenterRef, Int aiPosition, Bool abPlayerCanSeeMoveToRef)
+	_MakeSureRecoveryTrackingReady()
+	Int iRecoveryIndex = ActorsMovedForRecovery.Find(akActorRef)
+	Float fCurrentTime = Utility.GetCurrentRealTime()
+
+	if(iRecoveryIndex >= 0)
+		if(ActorsMovedToCenterForRecovery.Find(akActorRef) >= 0)
+			return false
+		endif
+		if(akActorRef.Is3DLoaded() || _IsFightingOpposingAssaultActor(akActorRef))
+			_MarkRecoveryMovePointSafe(akActorRef, iRecoveryIndex)
+			return false
+		endif
+
+		if(fCurrentTime < ActorRecoveryMoveTimes[iRecoveryIndex])
+			ActorRecoveryMoveTimes[iRecoveryIndex] = fCurrentTime
+		endif
+
+		if(fCurrentTime >= ActorRecoveryMoveTimes[iRecoveryIndex] + fEnemyRecoveryFallbackTime)
+			ObjectReference kSafePoint = _GetSafeRecoveryMovePoint(akPlayerRef, ActorRecoveryMovePoints[iRecoveryIndex])
+			if(kSafePoint != None && iCenterRecoveryMovesThisCheck < iMaxCenterRecoveryMovesPerCheck && ! akPlayerRef.HasDetectionLOS(akActorRef))
+				iCenterRecoveryMovesThisCheck += 1
+				if(ActorsMovedToSafeRecoveryPoint.Find(akActorRef) < 0)
+					ActorsMovedToSafeRecoveryPoint.Add(akActorRef)
+				endif
+				ActorRecoveryMoveTimes[iRecoveryIndex] = fCurrentTime
+				ActorRecoveryMovePoints[iRecoveryIndex] = kSafePoint
+				ModTraceCustom(sLogName, "          Recovery move timed out, moving actor " + akActorRef + " to safe point " + kSafePoint + ".")
+				return _MoveActorForAssault(akActorRef, kSafePoint, aiPosition)
+			endif
+
+			; KG 3.7.0 - Once we know a safe point works, never fall back to moving enemies on top of the player
+			if( ! _HasSafeRecoveryMovePoint())
+				if(akCenterRef == None)
+					akCenterRef = akMoveToRef
+				endif
+
+				if(iCenterRecoveryMovesThisCheck < iMaxCenterRecoveryMovesPerCheck && ( ! akActorRef.Is3DLoaded() || ! akPlayerRef.HasDetectionLOS(akActorRef)))
+					iCenterRecoveryMovesThisCheck += 1
+					ActorsMovedToCenterForRecovery.Add(akActorRef)
+					ModTraceCustom(sLogName, "          Recovery move timed out, moving actor " + akActorRef + " to the center at " + akCenterRef + ".")
+					return _MoveActorForAssault(akActorRef, akCenterRef, aiPosition)
+				endif
+			endif
+		endif
+
+		return false
+	endif
+	if(akActorRef.Is3DLoaded() || _IsFightingOpposingAssaultActor(akActorRef))
+		return false
+	endif
+
+	Float fDistanceToPlayer = akPlayerRef.GetDistance(akActorRef)
+	if(bPlayerInvolved && ! abPlayerCanSeeMoveToRef && akActorRef.GetDistance(akMoveToRef) > 1000.0 && ! akPlayerRef.HasDetectionLOS(akActorRef) && fDistanceToPlayer > 2000.0)
+		ObjectReference kRecoveryPoint = _GetSafeRecoveryMovePoint(akPlayerRef)
+		Bool bUsingSafePoint = kRecoveryPoint != None
+		if(kRecoveryPoint == None)
+			kRecoveryPoint = akMoveToRef
+		endif
+		_RecordEnemyRecoveryMoveV2(akActorRef, fCurrentTime, kRecoveryPoint)
+		if(bUsingSafePoint)
+			ActorsMovedToSafeRecoveryPoint.Add(akActorRef)
+		endif
+		ModTraceCustom(sLogName, "          Moving actor " + akActorRef + " back to the assault at " + kRecoveryPoint + ".")
+		return _MoveActorForAssault(akActorRef, kRecoveryPoint, aiPosition)
+	endif
+
+	return false
+EndFunction
+
+
 ; Added in 1.1.10 to ensure an assault doesn't get stuck if an Alias script fails to register a death/subdue
 ; 2.3.11 - Modified this check to also do a full reset of the location of unloaded or non-visible enemies to avoid them stuck under the world. Previously this would only hit the first NPC and then exit the check.
 Bool Function CheckForEnemiesDown()
@@ -1994,6 +2446,12 @@ Bool Function CheckForEnemiesDown()
 	else
 		kMoveToRef = kDefendFromRef
 	endif
+
+	_MakeSureRecoveryTrackingReady()
+
+	ObjectReference kCenterRef = CenterMarkerAlias.GetRef()
+	Actor[] ActorsToRestore = new Actor[0]
+	iCenterRecoveryMovesThisCheck = 0
 	
 	Bool bPlayerCanSeeMoveToRef = PlayerRef.HasDetectionLOS(kMoveToRef)
 	
@@ -2013,19 +2471,9 @@ Bool Function CheckForEnemiesDown()
 					endif
 					
 					if(bAutoAttemptToPreventEnemiesUnderTheWorld)
-						Bool bIsActor3dloaded = thisActor.Is3dLoaded()
-						Float fDistanceToPlayer = PlayerRef.GetDistance(thisActor)
-							; We're only trying to move actors that are stuck under the world - this should only happen near the start location, hence the small distance check
-						if(bPlayerInvolved && ! bPlayerCanSeeMoveToRef && thisActor.GetDistance(kMoveToRef) > 1000.0 && ! PlayerRef.HasDetectionLOS(thisActor) && fDistanceToPlayer > 2000.0)
-						
-							; In case the actor fled, the AI package took it somewhere strange, or the game put them under the world
-							
-							thisActor.MoveTo(kMoveToRef)
-							
-							if(bIsActor3dloaded)
-								thisActor.MoveToNearestNavmeshLocation()
-							endif
-						endif				
+						if(_TryToRecoverEnemy(thisActor, PlayerRef, kMoveToRef, kCenterRef, i, bPlayerCanSeeMoveToRef))
+							ActorsToRestore.Add(thisActor)
+						endif
 						
 						bAllDown = false
 					endif
@@ -2056,26 +2504,9 @@ Bool Function CheckForEnemiesDown()
 					
 					if(bAutoAttemptToPreventEnemiesUnderTheWorld)
 						ModTraceCustom(sLogName, "          Checking can move actor " + thisActor + ".")
-						Bool bIsActor3dloaded = thisActor.Is3dLoaded()
-						Float fDistanceToPlayer = PlayerRef.GetDistance(thisActor)
-							; We're only trying to move actors that are stuck under the world - this should only happen near the start location, hence the small distance check
-						if(bPlayerInvolved && ! bPlayerCanSeeMoveToRef && thisActor.GetDistance(kMoveToRef) > 1000.0 && ! PlayerRef.HasDetectionLOS(thisActor) && fDistanceToPlayer > 2000.0)
-						
-							; In case the actor fled, the AI package took it somewhere strange, or the game put them under the world
-							ModTraceCustom(sLogName, "          Moving actor " + thisActor + " to " + kMoveToRef + ".")
-							thisActor.MoveTo(kMoveToRef)
-							
-							if(bIsActor3dloaded)
-								thisActor.MoveToNearestNavmeshLocation()
-							endif
-						else
-							ModTraceCustom(sLogName, "          Actor " + thisActor + " failed move checks.")
-							ModTraceCustom(sLogName, "                  bPlayerInvolved = " + bPlayerInvolved)
-							ModTraceCustom(sLogName, "                  bPlayerCanSeeMoveToRef = " + bPlayerCanSeeMoveToRef)
-							ModTraceCustom(sLogName, "                  " + thisActor + ".GetDistance(" + kMoveToRef + ") = " + thisActor.GetDistance(kMoveToRef))
-							ModTraceCustom(sLogName, "                  PlayerRef.HasDetectionLOS(" + thisActor + ") = " +  PlayerRef.HasDetectionLOS(thisActor))
-							ModTraceCustom(sLogName, "                  fDistanceToPlayer = " + fDistanceToPlayer)
-						endif			
+						if(_TryToRecoverEnemy(thisActor, PlayerRef, kMoveToRef, kCenterRef, i, bPlayerCanSeeMoveToRef))
+							ActorsToRestore.Add(thisActor)
+						endif
 						
 						bAllDown = false
 					endif
@@ -2085,6 +2516,8 @@ Bool Function CheckForEnemiesDown()
 			endif
 		endWhile
 	endif
+
+	_RestoreActorsAfterMove(ActorsToRestore, abWaitForPhysics = true)
 	
 	return bAllDown
 EndFunction

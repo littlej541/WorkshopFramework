@@ -30,6 +30,21 @@ int SelfDestructTimerID = 0
 Bool Property bAutoDestroy = true Auto Hidden ; Note: When turning off AutoDestroy - you are in charge of calling SelfDestruct on this thread when you are done
 Int Property iCallBackID = -1 Auto Hidden
 String Property sCustomCallbackID = "" Auto Hidden
+ObjectReference Property kDurableOwnerRef Auto Hidden
+Keyword Property kDurableTrackingKeyword Auto Hidden
+Int Property iDurableOperationID = -1 Auto Hidden
+Int Property iDurableBatchID = -1 Auto Hidden
+Form Property kDurableLayout Auto Hidden
+Int Property iDurableItemIndex = -1 Auto Hidden
+Int Property iDurableItemGroup = -1 Auto Hidden
+Bool Property bDurableQueued = false Auto Hidden
+Bool Property bThreadRunStarted = false Auto Hidden
+Bool Property bThreadRunComplete = false Auto Hidden
+Bool Property bRunnerCompletionHandled = false Auto Hidden
+Bool Property bDurableCredited = false Auto Hidden
+Float Property fDurableQueueTime = 0.0 Auto Hidden
+Float Property fThreadRunStartTime = 0.0 Auto Hidden
+Float Property fThreadRunCompleteTime = 0.0 Auto Hidden
 
 ; -
 ; Events
@@ -48,7 +63,11 @@ EndEvent
 ; -
 
 Function StartThread()
+	bThreadRunStarted = true
+	fThreadRunStartTime = Utility.GetCurrentRealTime()
 	RunCode()	
+	bThreadRunComplete = true
+	fThreadRunCompleteTime = Utility.GetCurrentRealTime()
 	
 	Var[] kArgs = new Var[2]
 	
@@ -80,4 +99,47 @@ EndFunction
 
 Function ReleaseObjectReferences()
 	; Implement Me - any global variables that you stored an object reference in need to be set to none or that reference and this thread will be permanently persisted causing a memory leak!
+EndFunction
+
+Function ConfigureDurableTracking(ObjectReference akOwnerRef, Keyword akTrackingKeyword, Int aiOperationID, Int aiBatchID = -1)
+	kDurableOwnerRef = akOwnerRef
+	kDurableTrackingKeyword = akTrackingKeyword
+	iDurableOperationID = aiOperationID
+	iDurableBatchID = aiBatchID
+	bAutoDestroy = false
+
+	if(kDurableOwnerRef && kDurableTrackingKeyword)
+		SetLinkedRef(kDurableOwnerRef, kDurableTrackingKeyword)
+	endif
+EndFunction
+
+Function PrepareDurableRetry()
+	bDurableQueued = false
+	bThreadRunStarted = false
+	bThreadRunComplete = false
+	bRunnerCompletionHandled = false
+	fDurableQueueTime = 0.0
+	fThreadRunStartTime = 0.0
+	fThreadRunCompleteTime = 0.0
+EndFunction
+
+Function FinishDurableTracking()
+	if(kDurableOwnerRef && kDurableTrackingKeyword)
+		SetLinkedRef(None, kDurableTrackingKeyword)
+	endif
+
+	kDurableOwnerRef = None
+	kDurableTrackingKeyword = None
+	iDurableOperationID = -1
+	iDurableBatchID = -1
+	kDurableLayout = None
+	iDurableItemIndex = -1
+	iDurableItemGroup = -1
+	bAutoDestroy = true
+
+	if(IsBoundGameObjectAvailable())
+		StartTimer(30.0)
+	else
+		ReleaseObjectReferences()
+	endif
 EndFunction
