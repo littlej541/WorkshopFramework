@@ -35,6 +35,7 @@ Keyword Property kDurableTrackingKeyword Auto Hidden
 Int Property iDurableOperationID = -1 Auto Hidden
 Int Property iDurableBatchID = -1 Auto Hidden
 Form Property kDurableLayout Auto Hidden
+Form Property kDurableTargetForm Auto Hidden
 Int Property iDurableItemIndex = -1 Auto Hidden
 Int Property iDurableItemGroup = -1 Auto Hidden
 Bool Property bDurableQueued = false Auto Hidden
@@ -42,6 +43,9 @@ Bool Property bThreadRunStarted = false Auto Hidden
 Bool Property bThreadRunComplete = false Auto Hidden
 Bool Property bRunnerCompletionHandled = false Auto Hidden
 Bool Property bDurableCredited = false Auto Hidden
+Bool Property bDurableRunFailed = false Auto Hidden
+Int Property iDurableRetryCount = 0 Auto Hidden
+Int Property iDurableRunnerIndex = -1 Auto Hidden
 Float Property fDurableQueueTime = 0.0 Auto Hidden
 Float Property fThreadRunStartTime = 0.0 Auto Hidden
 Float Property fThreadRunCompleteTime = 0.0 Auto Hidden
@@ -97,6 +101,10 @@ Function RunCode()
 	; Extend me
 EndFunction
 
+Bool Function WasThreadRunSuccessful()
+	return true
+EndFunction
+
 Function ReleaseObjectReferences()
 	; Implement Me - any global variables that you stored an object reference in need to be set to none or that reference and this thread will be permanently persisted causing a memory leak!
 EndFunction
@@ -118,6 +126,8 @@ Function PrepareDurableRetry()
 	bThreadRunStarted = false
 	bThreadRunComplete = false
 	bRunnerCompletionHandled = false
+	bDurableRunFailed = false
+	iDurableRunnerIndex = -1
 	fDurableQueueTime = 0.0
 	fThreadRunStartTime = 0.0
 	fThreadRunCompleteTime = 0.0
@@ -133,8 +143,10 @@ Function FinishDurableTracking()
 	iDurableOperationID = -1
 	iDurableBatchID = -1
 	kDurableLayout = None
+	kDurableTargetForm = None
 	iDurableItemIndex = -1
 	iDurableItemGroup = -1
+	iDurableRunnerIndex = -1
 	bAutoDestroy = true
 
 	if(IsBoundGameObjectAvailable())

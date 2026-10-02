@@ -24,8 +24,12 @@ Float NULLARGUMENT = -1522753.0 Const ; Copied from ThreadManager
 Int OVERLOADTHRESHOLD = 20 Const ; Copied from ThreadManager
 Int iTimerID_QueuePump = 1 Const
 Float fQueuePumpInterval = 5.0 Const
+Float fQueuePumpRecoveryDelay = 30.0 Const
 Float fThreadStartTimeout = 30.0 Const
 Float fThreadRunTimeout = 300.0 Const
+Float fDurableRunRetryDelay = 2.0 Const
+Int iMaxDurableRunRetries = 3 Const
+String sLayoutRecoveryLog = "WSFWLayoutRecovery" Const
 
 ; ---------------------------------------------
 ; Custom Events
@@ -274,6 +278,7 @@ int iRunningThreads = 0
 WorkshopFramework:Library:ObjectRefs:Thread kRunningThread
 Float fRunningThreadStartTime = 0.0
 Bool bQueuePumpTimerRunning = false
+Float fQueuePumpTimerStartTime = 0.0
 
 ; ---------------------------------------------
 ; States 
@@ -292,6 +297,7 @@ EndEvent
 Event OnTimer(Int aiTimerID)
 	if(aiTimerID == iTimerID_QueuePump)
 		bQueuePumpTimerRunning = false
+		fQueuePumpTimerStartTime = 0.0
 		PumpDurableQueue()
 	endif
 EndEvent
@@ -308,6 +314,7 @@ Function HandleGameLoaded()
 	kRunningThread = None
 	fRunningThreadStartTime = 0.0
 	bQueuePumpTimerRunning = false
+	fQueuePumpTimerStartTime = 0.0
 	
 	Parent.HandleGameLoaded()
 	
@@ -434,10 +441,37 @@ Bool Function QueueDurableThread(WorkshopFramework:Library:ObjectRefs:Thread akT
 EndFunction
 
 Function StartQueuePumpTimer(Float afDelay)
+	Float fCurrentTime = Utility.GetCurrentRealTime()
+	Float fElapsed = fCurrentTime - fQueuePumpTimerStartTime
+	if(bQueuePumpTimerRunning && (fQueuePumpTimerStartTime <= 0.0 || fElapsed > fQueuePumpRecoveryDelay))
+		CancelTimer(iTimerID_QueuePump)
+		bQueuePumpTimerRunning = false
+		Debug.TraceUser(sLayoutRecoveryLog, "Reset overdue durable queue pump on " + Self + " after " + fElapsed + " seconds", 1)
+	endif
 	if( ! bQueuePumpTimerRunning)
 		bQueuePumpTimerRunning = true
+		fQueuePumpTimerStartTime = fCurrentTime
 		StartTimer(afDelay, iTimerID_QueuePump)
 	endif
+EndFunction
+
+Bool Function ReleaseDurableThread(WorkshopFramework:Library:ObjectRefs:Thread akThreadRef)
+	if( ! akThreadRef || QueuedThreads.Find(akThreadRef) < 0)
+		return false
+	endif
+
+	UnregisterForCustomEvent(akThreadRef, "ThreadRunComplete")
+	QueuedThreads.RemoveRef(akThreadRef)
+	QueueCounter.Mod(-1)
+	if(kRunningThread == akThreadRef)
+		kRunningThread = None
+		fRunningThreadStartTime = 0.0
+		iRunningThreads = 0
+	endif
+	akThreadRef.bDurableQueued = false
+	akThreadRef.iDurableRunnerIndex = -1
+	StartQueuePumpTimer(0.1)
+	return true
 EndFunction
 
 
@@ -523,7 +557,28 @@ Function HandleCompletedThreadV2(WorkshopFramework:Library:ObjectRefs:Thread akT
 		return
 	endif
 
-	Bool bAwaitingDurableCredit = akThreadRef.bDurableQueued && akThreadRef.sCustomCallbackID != "" && ! akThreadRef.bDurableCredited
+	if(akThreadRef.bDurableQueued && akThreadRef.bThreadRunComplete && ! akThreadRef.WasThreadRunSuccessful() && akThreadRef.iDurableRetryCount < iMaxDurableRunRetries)
+		akThreadRef.iDurableRetryCount += 1
+		Int iRunnerIndex = akThreadRef.iDurableRunnerIndex
+		Debug.TraceUser(sLayoutRecoveryLog, "Retrying failed durable worker " + akThreadRef + " on runner " + Self + " - operation=" + akThreadRef.iDurableOperationID + ", layout=" + akThreadRef.kDurableLayout + ", form=" + akThreadRef.kDurableTargetForm + ", item=" + akThreadRef.iDurableItemIndex + ", group=" + akThreadRef.iDurableItemGroup + ", attempt=" + akThreadRef.iDurableRetryCount, 1)
+		UnregisterForCustomEvent(akThreadRef, "ThreadRunComplete")
+		if(kRunningThread == akThreadRef)
+			kRunningThread = None
+			fRunningThreadStartTime = 0.0
+			iRunningThreads = 0
+		endif
+		akThreadRef.PrepareDurableRetry()
+		akThreadRef.iDurableRunnerIndex = iRunnerIndex
+		akThreadRef.bDurableQueued = true
+		akThreadRef.fDurableQueueTime = Utility.GetCurrentRealTime()
+		StartQueuePumpTimer(fDurableRunRetryDelay)
+		return
+	elseif(akThreadRef.bDurableQueued && akThreadRef.bThreadRunComplete && ! akThreadRef.WasThreadRunSuccessful())
+		akThreadRef.bDurableRunFailed = true
+		Debug.TraceUser(sLayoutRecoveryLog, "Durable worker failed after retries " + akThreadRef + " on runner " + Self + " - operation=" + akThreadRef.iDurableOperationID + ", layout=" + akThreadRef.kDurableLayout + ", form=" + akThreadRef.kDurableTargetForm + ", item=" + akThreadRef.iDurableItemIndex + ", group=" + akThreadRef.iDurableItemGroup, 2)
+	endif
+
+	Bool bAwaitingDurableCredit = akThreadRef.bDurableQueued && akThreadRef.kDurableOwnerRef && akThreadRef.kDurableTrackingKeyword && akThreadRef.sCustomCallbackID != "" && ! akThreadRef.bDurableCredited
 	if(akThreadRef.bDurableQueued && ! bAwaitingDurableCredit)
 		QueuedThreads.RemoveRef(akThreadRef)
 		akThreadRef.bDurableQueued = false
@@ -564,18 +619,20 @@ Function HandleCompletedThreadV2(WorkshopFramework:Library:ObjectRefs:Thread akT
 EndFunction
 
 Function PumpDurableQueue()
-	if(kRunningThread)
+	WorkshopFramework:Library:ObjectRefs:Thread kCurrentThread = kRunningThread
+	if(kCurrentThread)
 		Float fElapsed = Utility.GetCurrentRealTime() - fRunningThreadStartTime
-		if(kRunningThread.bThreadRunComplete)
-			HandleCompletedThread(kRunningThread)
-		elseif(( ! kRunningThread.bThreadRunStarted && fElapsed >= fThreadStartTimeout) || fElapsed >= fThreadRunTimeout)
-			WorkshopFramework:Library:ObjectRefs:Thread kRetryThread = kRunningThread
-			UnregisterForCustomEvent(kRetryThread, "ThreadRunComplete")
-			kRunningThread = None
-			fRunningThreadStartTime = 0.0
-			iRunningThreads = 0
-			kRetryThread.PrepareDurableRetry()
-			QueueDurableThread(kRetryThread)
+		if(kCurrentThread.bThreadRunComplete)
+			HandleCompletedThread(kCurrentThread)
+		elseif(( ! kCurrentThread.bThreadRunStarted && fElapsed >= fThreadStartTimeout) || fElapsed >= fThreadRunTimeout)
+			if(kRunningThread == kCurrentThread)
+				UnregisterForCustomEvent(kCurrentThread, "ThreadRunComplete")
+				kRunningThread = None
+				fRunningThreadStartTime = 0.0
+				iRunningThreads = 0
+				kCurrentThread.PrepareDurableRetry()
+				QueueDurableThread(kCurrentThread)
+			endif
 		endif
 	endif
 

@@ -69,6 +69,14 @@ MainQuest.RelinkLocalSettlers()
 EndFunction
 ;END FRAGMENT
 
+;BEGIN FRAGMENT Fragment_Terminal_10
+Function Fragment_Terminal_10(ObjectReference akTerminalRef)
+;BEGIN CODE
+MainQuest.RunWorkshopScriptCheck()
+;END CODE
+EndFunction
+;END FRAGMENT
+
 ;END FRAGMENT CODE - Do not edit anything between this and the begin comment
 
 WorkshopFramework:MainQuest Property MainQuest Auto Const Mandatory

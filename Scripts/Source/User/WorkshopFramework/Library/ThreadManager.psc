@@ -91,6 +91,10 @@ Auto State NotInitialized
 	Int Function QueueThreadDurable(WorkshopFramework:Library:ObjectRefs:Thread akThreadRef, String asMyCallbackID = "")
 		return NOTREADY
 	EndFunction
+
+	Int Function QueueThreadDurableV2(WorkshopFramework:Library:ObjectRefs:Thread akThreadRef, String asMyCallbackID = "", Int aiMaxThreads = -1)
+		return NOTREADY
+	EndFunction
 EndState
 
 
@@ -337,7 +341,11 @@ Int Function QueueThread(WorkshopFramework:Library:ObjectRefs:Thread akThreadRef
 EndFunction
 
 Int Function QueueThreadDurable(WorkshopFramework:Library:ObjectRefs:Thread akThreadRef, String asMyCallbackID = "")
-	int iRunnerIndex = GetNextThreadRunner()
+	return QueueThreadDurableV2(akThreadRef, asMyCallbackID)
+EndFunction
+
+Int Function QueueThreadDurableV2(WorkshopFramework:Library:ObjectRefs:Thread akThreadRef, String asMyCallbackID = "", Int aiMaxThreads = -1)
+	int iRunnerIndex = GetNextThreadRunnerV2(aiMaxThreads)
 
 	if(iRunnerIndex < 0 || ! akThreadRef)
 		return QUEUEFAIL
@@ -348,12 +356,31 @@ Int Function QueueThreadDurable(WorkshopFramework:Library:ObjectRefs:Thread akTh
 	akThreadRef.sCustomCallbackID = asMyCallbackID
 
 	WorkshopFramework:Library:ThreadRunner thisRunner = ThreadRunners[iRunnerIndex]
+	akThreadRef.iDurableRunnerIndex = iRunnerIndex
 	if( ! thisRunner.QueueDurableThread(akThreadRef))
+		akThreadRef.iDurableRunnerIndex = -1
 		gThreadRunnerQueueCounts[iRunnerIndex].Mod(-1)
 		return QUEUEFAIL
 	endif
 
 	return iCallbackID
+EndFunction
+
+Int Function RecoverDurableThread(WorkshopFramework:Library:ObjectRefs:Thread akThreadRef, String asMyCallbackID = "", Int aiMaxThreads = -1)
+	if( ! akThreadRef)
+		return QUEUEFAIL
+	endif
+
+	Int i = 0
+	while(i < ThreadRunners.Length)
+		if(ThreadRunners[i] && ThreadRunners[i].ReleaseDurableThread(akThreadRef))
+			akThreadRef.PrepareDurableRetry()
+			return QueueThreadDurableV2(akThreadRef, asMyCallbackID, aiMaxThreads)
+		endif
+		i += 1
+	endWhile
+
+	return QUEUEFAIL
 EndFunction
 
 
@@ -376,7 +403,24 @@ EndFunction
 
 
 Int Function GetNextThreadRunner()
-	int iRunnerIndex = NextRunner	
+	return GetNextThreadRunnerV2()
+EndFunction
+
+Int Function GetNextThreadRunnerV2(Int aiMaxThreads = -1)
+	Int iThreadLimit = iMaxThreads
+	if(aiMaxThreads > 0 && aiMaxThreads < iThreadLimit)
+		iThreadLimit = aiMaxThreads
+	endif
+	if(iThreadLimit <= 0 || iThreadLimit > ThreadRunners.Length)
+		iThreadLimit = ThreadRunners.Length
+	endif
+
+	iNextRunner += 1
+	if(iNextRunner >= iThreadLimit)
+		iNextRunner = 0
+	endif
+
+	int iRunnerIndex = iNextRunner
 	
 	if(iRunnerIndex >= 0)		
 		gThreadRunnerQueueCounts[iRunnerIndex].Mod(1)

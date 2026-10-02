@@ -36,6 +36,9 @@ Float fTimerLength_BuildableAreaCheckForExit = 3.0 Const
 Int iTimerID_WaitToSendExitEvent = 200 Const
 Float fTimerLength_WaitToSendExitEvent = 5.0
 
+Int iTimerID_WorkshopScriptCheck = 250 Const
+Float fTimerLength_WorkshopScriptCheck = 10.0 Const
+
 Int iEntryExitStatus_Clear = 0 Const
 Int iEntryExitStatus_EnterWaitingForBuildArea = 1 Const
 Int iEntryExitStatus_In = 2 Const
@@ -85,6 +88,11 @@ Group Assets
 	Perk Property ActivationPerk Auto Const Mandatory
 EndGroup
 
+Group Vanilla
+	WorkshopScript Property WorkshopScriptCheckWorkshop Auto Const Mandatory
+	Form Property WorkshopScriptCheckObjectBase Auto Const Mandatory
+EndGroup
+
 Group FormLists
 	FormList Property WorkshopParentExcludeFromAssignmentRules Auto Const Mandatory
 	{ Point to the same list as WorkshopParent.ParentExcludeFromAssignmentRules }
@@ -113,6 +121,8 @@ Group Messages
 	Message Property PowerGridResetWarning Auto Const Mandatory
 	Message Property PostResetPowerGridRebuildConfirm Auto Const Mandatory
 	Message Property WorkshopScriptOverwriteWarning Auto Const Mandatory
+	Message Property WorkshopScriptCheckStarted Auto Const Mandatory
+	Message Property WorkshopScriptCheckResults Auto Const Mandatory
 EndGroup
 
 ; ---------------------------------------------
@@ -144,6 +154,15 @@ EndFunction
 
 workshopscript kWaitingForSettlementExit = none  ; stores the workshop of a settlement that is waiting for the exit timer to complete before PlayerExitedSettlement is sent
 workshopscript kInBuildableAreaWorkshop = none ; stores the workshop of the settlement being checked for buildable area before triggering enter or exit events
+
+Bool bWorkshopScriptCheckRunning = false
+Bool bWorkshopScriptCheckRetried = false
+Int iWorkshopScriptCheckResult = 0
+Int iWorkshopParentScriptCheckResult = 0
+Int iWorkshopObjectScriptCheckResult = 0
+Int iWorkshopNPCScriptCheckResult = 0
+WorkshopObjectScript kWorkshopScriptCheckObject
+WorkshopNPCScript kWorkshopScriptCheckNPC
 
 ; ---------------------------------------------
 ; Events
@@ -395,6 +414,8 @@ Event OnTimer(Int aiTimerID)
 			kInBuildableAreaWorkshop = kWaitingForSettlementExit
 			Self.StartTimer(fTimerLength_BuildableAreaCheckForExit, iTimerID_BuildableAreaCheckForExit)
 		endif
+	elseif(aiTimerID == iTimerID_WorkshopScriptCheck)
+		_HandleWorkshopScriptCheckTimer()
 	endif
 EndEvent
 
@@ -477,6 +498,13 @@ EndFunction
 Function HandleGameLoaded()
 	; Make sure our debug log is open
 	WorkshopFramework:Library:UtilityFunctions.StartUserLog()
+
+	CancelTimer(iTimerID_WorkshopScriptCheck)
+	if(kWorkshopScriptCheckObject || kWorkshopScriptCheckNPC)
+		_CleanupWorkshopScriptCheckRefs()
+	endif
+	bWorkshopScriptCheckRunning = false
+	bWorkshopScriptCheckRetried = false
 
 	ModTrace("[WSFW] >>>>>>>>>>>>>>>>> HandleGameLoaded called on WSFW MainQuest")
 
@@ -1156,7 +1184,7 @@ Function CheckForWorkshopScriptOverwrites()
 	; Check WorkshopNPCScript
 	WorkshopNPCScript kTempNPC = NPCManager.CreateNPC(NPCManager.SettlerActorBase, kTempRef) as WorkshopNPCScript
 	
-	var WorkshopNPCScriptCheck = kTempRef.GetPropertyValue("WSFWOverwriteCheck")
+	var WorkshopNPCScriptCheck = kTempNPC.GetPropertyValue("WSFWOverwriteCheck")
 	if( ! (WorkshopNPCScriptCheck as Quest))
 		ModTrace("   WorkshopNPCScript: Overwritten!")
 		bOverwriteFound = true
@@ -1187,6 +1215,156 @@ Function RelinkLocalSettlers()
 	
 	currentWorkshop.RelinkWorkshopActors()
 endFunction
+
+
+Function RunWorkshopScriptCheck()
+	Var[] kArgs = new Var[0]
+	CallFunctionNoWait("_RunWorkshopScriptCheck", kArgs)
+EndFunction
+
+
+Function _RunWorkshopScriptCheck()
+	if(bWorkshopScriptCheckRunning)
+		WorkshopScriptCheckStarted.Show()
+		return
+	endif
+
+	CancelTimer(iTimerID_WorkshopScriptCheck)
+	_CleanupWorkshopScriptCheckRefs()
+
+	iWorkshopScriptCheckResult = 0
+	iWorkshopParentScriptCheckResult = 0
+	iWorkshopObjectScriptCheckResult = 0
+	iWorkshopNPCScriptCheckResult = 0
+	bWorkshopScriptCheckRunning = true
+	bWorkshopScriptCheckRetried = false
+
+	WorkshopScriptCheckStarted.Show()
+	_PrepareWorkshopScriptCheckRefs()
+	_RunWorkshopScriptChecks()
+	StartTimer(fTimerLength_WorkshopScriptCheck, iTimerID_WorkshopScriptCheck)
+EndFunction
+
+
+Function _PrepareWorkshopScriptCheckRefs()
+	if( ! kWorkshopScriptCheckObject && WorkshopScriptCheckWorkshop && WorkshopScriptCheckObjectBase)
+		kWorkshopScriptCheckObject = WorkshopScriptCheckWorkshop.PlaceAtMe(WorkshopScriptCheckObjectBase) as WorkshopObjectScript
+		if(kWorkshopScriptCheckObject)
+			kWorkshopScriptCheckObject.DisableNoWait()
+		endif
+	endif
+
+	if( ! kWorkshopScriptCheckNPC && WorkshopScriptCheckWorkshop && NPCManager.SettlerActorBase)
+		kWorkshopScriptCheckNPC = WorkshopScriptCheckWorkshop.PlaceActorAtMe(NPCManager.SettlerActorBase) as WorkshopNPCScript
+		if(kWorkshopScriptCheckNPC)
+			kWorkshopScriptCheckNPC.DisableNoWait()
+		endif
+	endif
+EndFunction
+
+
+Function _RunWorkshopScriptChecks()
+	Var[] kArgs = new Var[0]
+	if(iWorkshopScriptCheckResult <= 0)
+		CallFunctionNoWait("_CheckWorkshopScriptStatus", kArgs)
+	endif
+	if(iWorkshopParentScriptCheckResult <= 0)
+		CallFunctionNoWait("_CheckWorkshopParentScriptStatus", kArgs)
+	endif
+	if(iWorkshopObjectScriptCheckResult <= 0)
+		CallFunctionNoWait("_CheckWorkshopObjectScriptStatus", kArgs)
+	endif
+	if(iWorkshopNPCScriptCheckResult <= 0)
+		CallFunctionNoWait("_CheckWorkshopNPCScriptStatus", kArgs)
+	endif
+EndFunction
+
+
+Function _CheckWorkshopScriptStatus()
+	if( ! WorkshopScriptCheckWorkshop)
+		iWorkshopScriptCheckResult = -1
+		return
+	endif
+
+	iWorkshopScriptCheckResult = 0
+	iWorkshopScriptCheckResult = WorkshopScriptCheckWorkshop.GetWSFWReplacementStatus()
+EndFunction
+
+
+Function _CheckWorkshopParentScriptStatus()
+	if( ! WorkshopParent)
+		iWorkshopParentScriptCheckResult = -1
+		return
+	endif
+
+	iWorkshopParentScriptCheckResult = 0
+	iWorkshopParentScriptCheckResult = WorkshopParent.GetWSFWReplacementStatus()
+EndFunction
+
+
+Function _CheckWorkshopObjectScriptStatus()
+	if( ! kWorkshopScriptCheckObject)
+		iWorkshopObjectScriptCheckResult = -1
+		return
+	endif
+
+	iWorkshopObjectScriptCheckResult = 0
+	iWorkshopObjectScriptCheckResult = kWorkshopScriptCheckObject.GetWSFWReplacementStatus()
+EndFunction
+
+
+Function _CheckWorkshopNPCScriptStatus()
+	if( ! kWorkshopScriptCheckNPC)
+		iWorkshopNPCScriptCheckResult = -1
+		return
+	endif
+
+	iWorkshopNPCScriptCheckResult = 0
+	iWorkshopNPCScriptCheckResult = kWorkshopScriptCheckNPC.GetWSFWReplacementStatus()
+EndFunction
+
+
+Function _HandleWorkshopScriptCheckTimer()
+	if( ! bWorkshopScriptCheckRunning)
+		return
+	endif
+
+	if( ! bWorkshopScriptCheckRetried && (iWorkshopScriptCheckResult <= 0 || iWorkshopParentScriptCheckResult <= 0 || iWorkshopObjectScriptCheckResult <= 0 || iWorkshopNPCScriptCheckResult <= 0))
+		bWorkshopScriptCheckRetried = true
+		_PrepareWorkshopScriptCheckRefs()
+		_RunWorkshopScriptChecks()
+		StartTimer(fTimerLength_WorkshopScriptCheck, iTimerID_WorkshopScriptCheck)
+		return
+	endif
+
+	_CompleteWorkshopScriptCheck()
+EndFunction
+
+
+Function _CompleteWorkshopScriptCheck()
+	Int iExpectedResult = 1
+	_CleanupWorkshopScriptCheckRefs()
+	bWorkshopScriptCheckRunning = false
+	bWorkshopScriptCheckRetried = false
+
+	ModTrace("Workshop script check results - Expected: " + iExpectedResult + "; WorkshopScript: " + iWorkshopScriptCheckResult + "; WorkshopParentScript: " + iWorkshopParentScriptCheckResult + "; WorkshopObjectScript: " + iWorkshopObjectScriptCheckResult + "; WorkshopNPCScript: " + iWorkshopNPCScriptCheckResult)
+	WorkshopScriptCheckResults.Show(iExpectedResult, iWorkshopScriptCheckResult, iWorkshopParentScriptCheckResult, iWorkshopObjectScriptCheckResult, iWorkshopNPCScriptCheckResult)
+EndFunction
+
+
+Function _CleanupWorkshopScriptCheckRefs()
+	if(kWorkshopScriptCheckObject)
+		kWorkshopScriptCheckObject.DisableNoWait()
+		kWorkshopScriptCheckObject.Delete()
+		kWorkshopScriptCheckObject = None
+	endif
+
+	if(kWorkshopScriptCheckNPC)
+		kWorkshopScriptCheckNPC.DisableNoWait()
+		kWorkshopScriptCheckNPC.Delete()
+		kWorkshopScriptCheckNPC = None
+	endif
+EndFunction
 
 Function FixPopulationRating()
 	ActorValue WorkshopRatingPopulation = Game.GetFormFromFile(0x0012723E, "Fallout4.esm") as ActorValue

@@ -2090,10 +2090,7 @@ Function ClearAssaultAliases()
 
 	SettlementLeader.Clear()
 	VerbAlias.Clear()
-	AttackFromAlias.Clear()
-	DefendFromAlias.Clear()
 	MapMarkerAlias.Clear()
-	WorkshopAlias.Clear()
 	CenterMarkerAlias.Clear()
 EndFunction
 

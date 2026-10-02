@@ -216,6 +216,11 @@ Function ReleaseObjectReferences()
 EndFunction
 
 Bool Property bVerbose = false Auto Hidden
+
+Bool Function WasThreadRunSuccessful()
+	return kResult != None && ! kResult.IsDeleted()
+EndFunction
+
 Function RunCode()
 	if(bVerbose)
 		Debug.MessageBox("RunCode called")

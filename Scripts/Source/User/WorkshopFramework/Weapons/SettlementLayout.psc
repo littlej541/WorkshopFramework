@@ -1800,6 +1800,7 @@ Int Function PlaceObjectsV2(WorkshopScript akWorkshopRef, Int aiObjectsGroupType
 				if(aiOperationID > 0 && akTrackingKeyword)
 					kThread.ConfigureDurableTracking(akWorkshopRef, akTrackingKeyword, aiOperationID, aiCustomCallbackID)
 					kThread.kDurableLayout = Self
+					kThread.kDurableTargetForm = kThread.SpawnMe
 					kThread.iDurableItemIndex = i
 					kThread.iDurableItemGroup = aiObjectsGroupType
 				endif
